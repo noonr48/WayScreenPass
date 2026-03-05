@@ -1,0 +1,33 @@
+# Remote Desktop Configuration
+# Copy to: ~/.config/remote-desktop/config.toml
+
+[network]
+# Port to listen on (only accessible via tailscale0)
+port = 3389
+
+[session]
+# Session persistence
+persist_mode = "persistent"
+
+[video]
+# Video encoding settings (unified software encoding for all GPUs)
+# Target: 1080p @ 30fps
+encoding = "software"
+preset = "veryfast"      # x264 preset (ultrafast to veryslow)
+quality = 23             # CRF 18-28, lower = better quality
+fps = 30                 # Target framerate
+
+[monitor]
+# Monitor selection
+auto_select_primary = true
+# selected_monitor = "DP-1"  # Uncomment to force specific monitor
+
+[input]
+# Input device support
+keyboard = true
+pointer = true
+clipboard = true
+
+[security]
+# Additional security options
+verify_tailnet_owner = true

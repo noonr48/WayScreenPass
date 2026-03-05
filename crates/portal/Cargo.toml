@@ -1,0 +1,22 @@
+[package]
+name = "remote-desktop-portal"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+ashpd = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+xxhash-rust = { workspace = true }
+
+# For chrono in session.rs
+chrono = "0.4"
+dirs = "5.0"
+
+# Input device handling via evdev
+evdev = "0.13"

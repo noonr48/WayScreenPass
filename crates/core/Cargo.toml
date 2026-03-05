@@ -1,0 +1,27 @@
+[package]
+name = "remote-desktop-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+pipewire = { workspace = true }
+zbus = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+glob = { workspace = true }
+
+# Protocol
+bytes = { workspace = true }
+bincode = { workspace = true }
+tokio-util = { workspace = true }
+
+# Video encoding (using x264 CLI)
+tempfile = "3"
+
+# Video encoding (optional, requires FFmpeg dev headers)
+# Note: Currently disabled due to build issues with newer FFmpeg
+# ffmpeg-next = { workspace = true, optional = true }

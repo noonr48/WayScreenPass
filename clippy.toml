@@ -1,0 +1,15 @@
+# Clippy Configuration
+# See: https://doc.rust-lang.org/clippy/lintconfiguration.html
+
+# Deny common issues
+warn-on-all-wildcard-imports = true
+
+# Allow certain lints for this project
+too-many-arguments-threshold = 7
+type-complexity-threshold = 250
+
+# Cognitive complexity threshold
+cognitive-complexity-threshold = 30
+
+# Documentation requirements
+missing-docs-in-private-items = false
