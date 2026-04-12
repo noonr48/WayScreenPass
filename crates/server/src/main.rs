@@ -8,13 +8,12 @@ mod status;
 mod virtual_display;
 
 use clap::{Parser, Subcommand};
-use tracing::{info, error, warn};
+use tracing::{info, error};
 use tracing_subscriber::EnvFilter;
 use connection::ServerState;
 use setup::SetupWizard;
 use status::display_status;
-use virtual_display::VirtualDisplay;
-use std::env;
+use virtual_display::{VirtualDisplay, launch_in_headless_session, read_session_metadata};
 
 #[derive(Parser)]
 #[command(name = "remote-desktop-server")]
@@ -65,6 +64,13 @@ enum Commands {
 
     /// Show status
     Status,
+
+    /// Launch an application inside the active headless session
+    Launch {
+        /// Command to run inside the headless session
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        command: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -85,35 +91,18 @@ async fn main() -> anyhow::Result<()> {
             let is_virtual = virtual_display;
             info!("Starting remote desktop server on port {} (virtual={})", port, is_virtual);
 
+            let state = ServerState::new();
+
             // Start virtual display if requested
-            let mut virtual_display_guard = if is_virtual {
-                info!("Starting virtual display mode...");
+            let virtual_display_guard = if is_virtual {
+                let compositor = virtual_display::check_compositor_available()?;
+                info!("Starting dedicated headless session with {}", compositor);
 
-                // Try to start a headless compositor (optional - will use test patterns if unavailable)
-                match virtual_display::check_compositor_available() {
-                    Ok(compositor) => {
-                        info!("Found {} for virtual display", compositor);
-
-                        let mut vd = VirtualDisplay::new(width, height, refresh);
-                        match vd.start() {
-                            Ok(wayland_socket) => {
-                                info!("Virtual display started on {}", wayland_socket);
-                                // Set WAYLAND_DISPLAY for capture
-                                unsafe { env::set_var("WAYLAND_DISPLAY", &wayland_socket); }
-                            }
-                            Err(e) => {
-                                warn!("Failed to start virtual display compositor: {}", e);
-                                warn!("Using test pattern generator instead");
-                            }
-                        }
-                        Some(vd)
-                    }
-                    Err(e) => {
-                        warn!("No headless compositor found: {}", e);
-                        warn!("Using test pattern generator for virtual display");
-                        None
-                    }
-                }
+                let mut vd = VirtualDisplay::new(width, height, refresh);
+                let session = vd.start()?;
+                state.set_virtual_mode(true);
+                state.set_headless_session(Some(session)).await;
+                Some(vd)
             } else {
                 None
             };
@@ -123,20 +112,40 @@ async fn main() -> anyhow::Result<()> {
                 error!("Failed to write PID file: {}", e);
             }
 
-            let state = ServerState::new();
-
-            // Set virtual display mode on state
-            if is_virtual {
-                state.set_virtual_mode(true);
-            }
-
             // Initialize input handler asynchronously
             let state_clone = state.clone();
+            let input_backend = if is_virtual {
+                remote_desktop_portal::InputBackend::Stub
+            } else {
+                remote_desktop_portal::InputBackend::Uinput
+            };
             tokio::spawn(async move {
-                state_clone.init_input_handler(remote_desktop_portal::InputBackend::Uinput).await;
+                state_clone.init_input_handler(input_backend).await;
             });
 
-            let result = connection::start_server(&format!("0.0.0.0:{}", port), state).await;
+            // Set up signal handling for clean shutdown
+            let shutdown_signal = async {
+                let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("Failed to set up SIGTERM handler");
+                let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    .expect("Failed to set up SIGINT handler");
+
+                tokio::select! {
+                    _ = sigterm.recv() => info!("Received SIGTERM"),
+                    _ = sigint.recv() => info!("Received SIGINT"),
+                }
+            };
+
+            let bind_addr = format!("0.0.0.0:{}", port);
+            let result = tokio::select! {
+                result = connection::start_server(&bind_addr, state) => {
+                    result
+                }
+                _ = shutdown_signal => {
+                    info!("Shutting down gracefully...");
+                    Ok(())
+                }
+            };
 
             // Clean up
             let _ = status::remove_pid_file();
@@ -152,23 +161,32 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::ListMonitors => {
             info!("Listing available monitors");
-            match remote_desktop_core::enumerate_monitors() {
-                Ok(monitors) => {
-                    println!("Available monitors:");
-                    for monitor in &monitors {
-                        println!("  - {} ({}x{}@{}Hz){}",
-                            monitor.name,
-                            monitor.resolution.0,
-                            monitor.resolution.1,
-                            monitor.refresh_rate,
-                            if monitor.is_primary { " [PRIMARY]" } else { "" }
-                        );
+            if let Some(session) = read_session_metadata()? {
+                println!("Available monitors:");
+                println!(
+                    "  - {} ({}x{}@{}Hz) [HEADLESS] [PRIMARY]",
+                    session.output_name, session.width, session.height, session.refresh_rate
+                );
+                Ok(())
+            } else {
+                match remote_desktop_core::enumerate_monitors() {
+                    Ok(monitors) => {
+                        println!("Available monitors:");
+                        for monitor in &monitors {
+                            println!("  - {} ({}x{}@{}Hz){}",
+                                monitor.name,
+                                monitor.resolution.0,
+                                monitor.resolution.1,
+                                monitor.refresh_rate,
+                                if monitor.is_primary { " [PRIMARY]" } else { "" }
+                            );
+                        }
+                        Ok(())
                     }
-                    Ok(())
-                }
-                Err(e) => {
-                    error!("Failed to list monitors: {}", e);
-                    Err(e.into())
+                    Err(e) => {
+                        error!("Failed to list monitors: {}", e);
+                        Err(e.into())
+                    }
                 }
             }
         }
@@ -176,6 +194,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Status => {
             info!("Checking status");
             display_status()
+        }
+
+        Commands::Launch { command } => {
+            info!("Launching {:?} in headless session", command);
+            launch_in_headless_session(&command)
         }
     }
 }

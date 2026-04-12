@@ -3,6 +3,10 @@ name = "remote-desktop-server"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+portal-capture = ["remote-desktop-core/portal-capture"]
+
 [[bin]]
 name = "remote-desktop-server"
 path = "src/main.rs"
@@ -23,6 +27,7 @@ xxhash-rust = { workspace = true }
 libc = "0.2"
 dirs = "5.0"
 which = "6.0"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Local crates
 remote-desktop-core = { path = "../core" }

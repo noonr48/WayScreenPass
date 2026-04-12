@@ -1,58 +1,110 @@
-# Remote Desktop for Wayland
+# WayScreenPass
 
-A custom remote desktop solution for KDE Plasma Wayland on Cachyos Linux.
+Headless Wayland remote desktop over Tailscale.
+
+WayScreenPass runs a dedicated headless Wayland session on the remote machine, captures that session with `grim`, streams it as H.264 over Tailscale, and lets you launch applications into the remoted desktop without relying on a portal prompt for each connection.
+
+## Architecture
+
+```
+CLIENT (your machine)                    SERVER (remote machine)
+┌──────────────────────┐                ┌──────────────────────────────┐
+│ SDL2 Window          │                │ Headless Sway Session        │
+│ H.264 Decoder (ffmpeg)│◄──TCP 3389──►│ H.264 Encoder (persistent x264)│
+│ Keyboard/Mouse Input │  (Tailscale)   │ grim PNG capture → RGB24     │
+│ Clipboard Sync       │                │ Clipboard Sync (wl-clipboard)│
+└──────────────────────┘                └──────────────────────────────┘
+```
 
 ## Features
 
-- **Zero-click access** after one-time setup
-- **Automatic monitor detection** - works with AMD and NVIDIA multi-GPU
-- **Tailscale-only** network isolation for security
-- **Persistent sessions** - no portal prompts after initial authorization
-- **Custom binary protocol** - optimized for low-latency streaming
-- **Real H.264 encoding** via x264 CLI
-- **PipeWire screen capture** - actual frame data from portal
-- **Input injection** via uinput virtual devices
+- **Headless session model** — dedicated remoted desktop on the same machine and user account
+- **No per-connection portal prompt** — headless mode avoids repeated screen-share approval dialogs
+- **Persistent x264 encoder** — single process, NAL unit parser, no per-frame fork
+- **Real monitor detection** — reads `/sys/class/drm/` sysfs for actual connected displays
+- **Headless app launch** — `remote-desktop-server launch <command>` starts apps inside the remoted session
+- **Proper input injection** — uinput remains available for the physical-session path
+- **Correct keycode mapping** — SDL2 scancodes translated to Linux evdev codes (80+ keys)
+- **Bidirectional clipboard** — event-driven via `wl-paste --watch`, supports text/html/image
+- **Auto-reconnection** — client reconnects with exponential backoff on disconnect
+- **Graceful shutdown** — SIGTERM/SIGINT signal handling with PID file cleanup
+- **Dedicated headless compositor** — sway + grim based session runtime
+- **Tailscale-only security** — nftables + IP verification (100.x.y.z range)
+- **Adaptive quality** — 5 quality levels from 1080p@8Mbps to 576p@1.5Mbps
+- **System tray app** — ksni-based tray for managing remote hosts
 
 ## Quick Start
 
-### One-Time Setup (on each machine you control)
+### Build
 
 ```bash
-# 1. Build the project
-cd remote-desktop-wayland
 cargo build --release
-
-# 2. Install nftables rules (Tailscale-only)
-sudo nft -f nftables-rules.conf
-
-# 3. Setup uinput for input injection
-sudo modprobe uinput
-sudo usermod -aG input $USER
-# Re-login to apply group changes
-
-# 4. Run setup wizard (approves portal access)
-./target/release/remote-desktop-server setup
-
-# 5. Enable service
-systemctl --user enable --now remote-desktop
 ```
 
-### Connect from Another Tailscale Machine
+### Server Setup (one-time, on remote machine)
 
 ```bash
-# List available monitors
-./target/release/remote-desktop connect <hostname> --list
+# 1. Install firewall rules
+sudo nft -f nftables-rules.conf
 
-# Connect (auto-selects primary monitor)
-./target/release/remote-desktop connect <hostname>
+# 2. Install headless-session runtime
+# Arch/CachyOS:
+sudo pacman -S sway grim
+
+# 3. Optional: enable uinput for the physical-session path
+sudo modprobe uinput
+sudo usermod -aG input $USER
+echo "uinput" | sudo tee /etc/modules-load.d/uinput.conf
+# Re-login after this
+
+# 4. Run setup wizard
+./target/release/remote-desktop-server setup --authorize
+
+# 5. Start the headless session server
+./target/release/remote-desktop-server start --virtual
+
+# 6. Launch an app into the headless session
+./target/release/remote-desktop-server launch foot
+```
+
+### Connect (from your machine)
+
+```bash
+# List monitors on remote
+./target/release/remote-desktop connect <tailscale-hostname> --list
+
+# Connect (auto-selects the headless output)
+./target/release/remote-desktop connect <tailscale-hostname>
 
 # Connect to specific monitor
-./target/release/remote-desktop connect <hostname> --monitor DP-2
+./target/release/remote-desktop connect <tailscale-hostname> --monitor HEADLESS-1
+```
+
+### System Tray
+
+```bash
+# Add a host
+./target/release/remote-desktop-tray add mypc 100.77.233.119
+
+# Launch tray icon
+./target/release/remote-desktop-tray
+```
+
+### Headless Session Mode
+
+```bash
+# Requires: sway, swaymsg, grim
+sudo pacman -S sway grim
+
+./target/release/remote-desktop-server start --virtual
+
+# Launch another application into the remoted desktop
+./target/release/remote-desktop-server launch alacritty
 ```
 
 ## Configuration
 
-Edit `~/.config/remote-desktop/config.toml`:
+`~/.config/remote-desktop/config.toml`:
 
 ```toml
 [network]
@@ -66,142 +118,49 @@ quality = 23
 auto_select_primary = true
 ```
 
-## Security
+## Crate Structure
 
-- Only accepts connections from `tailscale0` interface (100.x.y.z)
-- nftables rules enforce network isolation
-- Tailscale provides encryption and authentication
-- Portal-based authorization with persistent tokens
+| Crate | Type | Purpose |
+|-------|------|---------|
+| `core` | lib | Protocol, encoder, optional PipeWire capture, monitor detection |
+| `portal` | lib | Optional portal sessions, input injection (evdev), clipboard |
+| `server` | bin | TCP server, connection handler, headless session runtime |
+| `client` | bin | TCP client, SDL2 display, ffmpeg decoder, input mapping |
+| `tray` | bin | System tray (ksni), host management |
 
-## Requirements
+## Dependencies
 
-- **OS**: Cachyos Linux (or Arch-based)
-- **Desktop**: KDE Plasma 6 on Wayland
-- **Network**: Tailscale installed and running
-- **Dependencies**:
-  - PipeWire and wireplumber
-  - xdg-desktop-portal-kde
-  - x264 (for H.264 encoding)
-  - evdev (for input injection)
-  - nftables
+| Dependency | Purpose |
+|------------|---------|
+| x264 | H.264 encoding (persistent pipe) |
+| sway | Dedicated headless Wayland session |
+| grim | Capture frames from the headless session |
+| ashpd | Optional xdg-desktop-portal integration for physical-session capture |
+| evdev | uinput virtual keyboard/mouse |
+| SDL2 | Client display and input |
+| ffmpeg | Client H.264 decoding |
+| wl-clipboard | Clipboard sync (wl-paste --watch) |
+| Tailscale | Network encryption and auth |
+| nftables | Firewall (Tailscale-only) |
+| PipeWire (optional) | Future portal/physical-session capture path |
 
-## Current Status
-
-| Component | Status | Notes |
-|-----------|--------|-------|
-| Build System | ✅ Working | Clean compilation |
-| Server Binary | ✅ Working | Binds to 0.0.0.0:3389 |
-| Client Binary | ✅ Working | Connects and sends protocol messages |
-| Protocol Handshake | ✅ Working | Hello → HelloAck → MonitorList |
-| Monitor Detection | ✅ Working | Detects 3 monitors (AMD/NVIDIA multi-GPU) |
-| Tailscale Verification | ✅ Working | Accepts 100.x.y.z, rejects others |
-| Portal Integration | ✅ Working | ashpd, persistent sessions, PipeWire node ID |
-| PipeWire Stream | ✅ Implemented | Daemon connection, RGB24 frame capture |
-| H.264 Encoder | ✅ Working | x264 CLI, 833 bytes/frame @ 320x240 |
-| Video Streaming | ✅ Implemented | Full pipeline ready |
-| Input Injection | ✅ Implemented | evdev uinput (requires setup) |
-
-## Test Results
+## Tests
 
 ```bash
-# Unit Tests: ✅ ALL PASS (9 tests)
+# Run all tests (set WAYLAND_DISPLAY for clipboard/display tests)
+export WAYLAND_DISPLAY=wayland-0
 cargo test --workspace
 
-# H.264 Encoder: ✅ 833 bytes/frame
-cargo test --package remote-desktop-core test_encode_small_frame -- --nocapture
-
-# Monitor Detection: ✅ 3 monitors detected
-./target/release/remote-desktop-server list-monitors
-# Output: card3-DP-1, card2-DP-1, card1-DP-1 (all 1920x1080@60Hz)
-
-# Server Startup: ✅ Listening on port 3389
-./target/release/remote-desktop-server start
-# Output: "Remote desktop server listening on 0.0.0.0:3389"
-
-# Security: ✅ Correctly rejects non-Tailscale
-./target/release/remote-desktop connect 127.0.0.1 --list
-# Output: Connection reset (127.0.0.1 not in 100.x.y.z range)
+# 26 tests, 0 failures
 ```
 
-## Known Limitations
+## Security Model
 
-### uinput Setup Required for Input Injection
-
-Input injection requires `/dev/uinput` access. Without setup, events are logged but not injected.
-
-**One-time setup:**
-```bash
-sudo modprobe uinput
-sudo usermod -aG input $USER
-echo "uinput" | sudo tee /etc/modules-load.d/uinput.conf
-# Then re-login
-```
-
-### End-to-End Testing Pending
-
-The system is ready but not yet tested with:
-- Actual Tailscale connection between two machines
-- Real PipeWire screen capture (requires GUI portal dialog)
-- Live H.264 streaming to client
-
-## Development Status
-
-- **Protocol**: ✅ Complete and tested
-- **Network Layer**: ✅ Complete and tested
-- **Server Architecture**: ✅ Complete
-- **Client Architecture**: ✅ Complete
-- **Monitor Detection**: ✅ Complete (DRM, multi-GPU)
-- **Portal Integration**: ✅ Complete (ashpd, persistent tokens)
-- **PipeWire Capture**: ✅ Implemented (pipewire crate)
-- **H.264 Encoding**: ✅ Implemented (x264 CLI, YUV420P)
-- **Input Injection**: ✅ Implemented (evdev uinput)
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  CLIENT (controlling machine)                               │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
-│  │ CLI (rust)  │  │ Connection  │  │ Protocol Handler    │  │
-│  │             │─>│ Handler     │─>│ Hello/SelectMonitor │  │
-│  └─────────────┘  └─────────────┘  └─────────────────────┘  │
-└─────────────────────────┬─────────────────────────────────┘
-                          │ Tailscale (WireGuard encrypted)
-                          │ TCP 3389
-                          ▼
-┌─────────────────────────────────────────────────────────────┐
-│  SERVER (controlled machine)                                │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
-│  │ TCP Server  │  │ PipeWire    │  │ H.264 Encoder       │  │
-│  │ (tokio)     │─>│ Screencast  │─>│ x264 CLI            │  │
-│  └─────────────┘  └─────────────┘  └─────────────────────┘  │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │ Portal Integration (ashpd)                          │   │
-│  │ - Persistent authorization via restore_token        │   │
-│  │ - Input injection via evdev uinput                   │   │
-│  └──────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## Next Steps
-
-1. **End-to-End Testing** (HIGH PRIORITY)
-   - Test with two Tailscale-connected machines
-   - Verify portal screen capture dialog
-   - Test video streaming quality
-   - Test keyboard/mouse input
-
-2. **GPU Encoding** (OPTIONAL)
-   - Current x264 software encoding works
-   - VAAPI for AMD/Intel GPUs would reduce CPU
-   - Consider for 4K or high-framerate scenarios
-
-## Documentation
-
-- `TEST_RESULTS.md` - Detailed test results
-- `IMPLEMENTATION_SUMMARY.md` - Component breakdown
-- `CODING.md` - Development conventions
-- `docs/PROTOCOL.md` - Protocol specification
+- **Network**: Tailscale-only (100.x.y.z CGNAT range verified per-connection)
+- **Encryption**: WireGuard via Tailscale (no app-layer crypto needed)
+- **Authorization**: headless mode avoids per-connection screen-capture prompts by remoting a dedicated session instead of the live desktop
+- **Input**: current default headless build prioritizes safe session launch/capture; uinput remains available for the physical-session path
+- **Firewall**: nftables blocks all non-tailscale0 traffic to port 3389
 
 ## License
 

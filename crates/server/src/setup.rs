@@ -8,7 +8,6 @@ use std::io::{self, Write};
 use std::os::unix::fs::{PermissionsExt, MetadataExt};
 use std::path::Path;
 use std::process::Command;
-use tracing::info;
 
 /// Setup wizard for first-time configuration
 pub struct SetupWizard;
@@ -31,47 +30,52 @@ impl SetupWizard {
         let mut all_passed = true;
 
         // 1. Check uinput permissions
-        if !Self::check_uinput()? {
-            all_passed = false;
-        }
+        let _uinput_ready = Self::check_uinput()?;
 
         // 2. Check Tailscale
         if !Self::check_tailscale()? {
             all_passed = false;
         }
 
-        // 3. Check portal
-        if !Self::check_portal()? {
+        // 3. Check dedicated headless-session runtime
+        if !Self::check_headless_runtime()? {
             all_passed = false;
         }
 
-        // 4. Check wl-clipboard (for clipboard sync)
+        // 4. Check portal (optional for the headless path)
+        let portal_ready = Self::check_portal()?;
+
+        // 5. Check wl-clipboard (for clipboard sync)
         if !Self::check_wl_clipboard()? {
             all_passed = false;
         }
 
-        // 5. Check x264 encoder
+        // 6. Check x264 encoder
         if !Self::check_x264()? {
             all_passed = false;
         }
 
-        // 6. Pre-authorize screen capture if requested
+        // 7. Pre-authorize screen capture if requested
         if authorize {
             println!();
-            if !Self::authorize_screen_capture().await? {
+            if !portal_ready {
+                println!("   ⚠️  Portal support is not available, so authorization cannot be performed.");
+                println!("   💡 This is optional for the headless session path. Install a portal backend only if you also want current-session capture.");
+                all_passed = false;
+            } else if !Self::authorize_screen_capture().await? {
                 all_passed = false;
             }
         }
 
-        // 7. Ask about systemd service
+        // 8. Ask about systemd service
         Self::ask_install_systemd()?;
 
         println!();
         if all_passed {
             println!("✅ Setup complete! All checks passed.");
             println!();
-            println!("You can now start the server with:");
-            println!("  remote-desktop-server start");
+            println!("You can now start the headless session server with:");
+            println!("  remote-desktop-server start --virtual");
         } else {
             println!("⚠️  Setup complete with warnings.");
             println!("   Some features may not work until the issues above are resolved.");
@@ -128,11 +132,49 @@ impl SetupWizard {
         }
 
         println!("   ⚠️  /dev/uinput is not accessible by current user");
+        println!("   ℹ️  This is only needed for the physical-session/uinput path.");
+        println!("      The dedicated headless session path can still stream without it.");
         println!("   💡 Add yourself to the 'input' group:");
         println!("      sudo usermod -aG input $USER");
         println!("   💡 Then log out and log back in for changes to take effect");
         println!();
 
+        Ok(false)
+    }
+
+    /// Check runtime dependencies for the dedicated headless session path
+    fn check_headless_runtime() -> Result<bool> {
+        println!("📋 Checking headless session runtime...");
+
+        let checks = [
+            ("sway", "sway"),
+            ("swaymsg", "swaymsg"),
+            ("grim", "grim"),
+        ];
+
+        let mut missing = Vec::new();
+        for (binary, package_hint) in checks {
+            let exists = Command::new("which")
+                .arg(binary)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+
+            if exists {
+                println!("   ✅ {} is installed", binary);
+            } else {
+                println!("   ❌ {} is missing", binary);
+                missing.push(package_hint);
+            }
+        }
+
+        if missing.is_empty() {
+            println!("   ✅ Headless sway/grim runtime is ready");
+            return Ok(true);
+        }
+
+        println!("   💡 Install the missing tools to use 'remote-desktop-server start --virtual'");
+        println!("      Missing: {}", missing.join(", "));
         Ok(false)
     }
 
@@ -311,11 +353,11 @@ impl SetupWizard {
 
     /// Pre-authorize screen capture through the portal
     async fn authorize_screen_capture() -> Result<bool> {
-        use std::path::PathBuf;
+        
         println!("📋 Pre-authorizing screen capture...");
         println!();
         println!("   A portal dialog will appear - please select your screen and approve.");
-        println!("   This will save the authorization for future connections.");
+        println!("   This is optional and only applies to the portal/current-session capture path.");
         println!();
 
         // Create the session manager and request a session
@@ -328,13 +370,13 @@ impl SetupWizard {
                 println!("   ✅ Screen capture authorized!");
                 println!("   📍 PipeWire node ID: {}", session.pipewire_node_id());
                 println!();
-                println!("   Future connections will not require approval.");
+                println!("   Future current-session portal captures may not require approval.");
                 Ok(true)
             }
             Err(e) => {
                 println!();
                 println!("   ⚠️  Failed to authorize screen capture: {}", e);
-                println!("   💡 You can still use the server, but each connection will prompt for approval.");
+                println!("   💡 You can still use the headless session path with 'remote-desktop-server start --virtual'.");
                 Ok(false)
             }
         }
@@ -345,7 +387,7 @@ impl SetupWizard {
         println!();
         println!("📋 Systemd Service (Optional)");
         println!("   Would you like to install a systemd user service?");
-        println!("   This allows the server to start automatically on login.");
+        println!("   This allows the headless server to start automatically on login.");
         println!();
 
         print!("   Install systemd service? [y/N] ");
@@ -383,7 +425,7 @@ Wants=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.cargo/bin/remote-desktop-server start
+ExecStart=%h/.cargo/bin/remote-desktop-server start --virtual
 Restart=on-failure
 RestartSec=5
 

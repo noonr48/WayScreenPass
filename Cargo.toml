@@ -25,7 +25,7 @@ rust-version = "1.85"
 tokio = { version = "1.40", features = ["full"] }
 
 # Portal and PipeWire
-ashpd = { version = "0.10", features = ["pipewire", "wayland"] }
+ashpd = { version = "0.10", features = ["wayland"] }
 pipewire = "0.8"
 
 # DRM for monitor detection

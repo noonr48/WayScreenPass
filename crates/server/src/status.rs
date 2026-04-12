@@ -2,6 +2,7 @@
 //!
 //! Display current server status
 
+use crate::virtual_display::read_session_metadata;
 use anyhow::{Result, anyhow};
 use std::fs;
 use std::path::Path;
@@ -57,6 +58,7 @@ pub fn display_status() -> Result<()> {
     println!();
 
     let status = get_status()?;
+    let headless_session = read_session_metadata()?;
 
     if status.running {
         println!("Server Status: 🟢 RUNNING");
@@ -83,6 +85,16 @@ pub fn display_status() -> Result<()> {
 
     println!();
 
+    if let Some(ref session) = headless_session {
+        println!("Headless Session:");
+        println!("  🟢 {} on {}", session.compositor, session.output_name);
+        println!("  Socket: {}", session.wayland_display);
+        println!("  Size: {}x{}@{}Hz", session.width, session.height, session.refresh_rate);
+        println!("  Launch apps with:");
+        println!("    remote-desktop-server launch <command> [args...]");
+        println!();
+    }
+
     // Show portal status
     println!("Portal Status:");
     if is_portal_running() {
@@ -94,7 +106,10 @@ pub fn display_status() -> Result<()> {
     // Show uinput status
     println!();
     println!("Input Injection:");
-    if is_uinput_accessible() {
+    if headless_session.is_some() {
+        println!("  ℹ️  Headless mode currently uses the safe stub backend");
+        println!("     A dedicated wlroots virtual-input backend still needs to be implemented");
+    } else if is_uinput_accessible() {
         println!("  🟢 /dev/uinput is accessible");
     } else {
         println!("  🔴 /dev/uinput is not accessible");

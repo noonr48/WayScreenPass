@@ -1,227 +1,197 @@
-//! Virtual Display Module
+//! Headless Wayland session management.
 //!
-//! Creates a headless Wayland compositor with virtual output for remote desktop
-//! without requiring portal permissions.
+//! The first implementation target is a dedicated sway session running on a
+//! headless wlroots backend. That gives the server a real Wayland desktop on
+//! the same machine while avoiding portal prompts for screen capture.
 
-use anyhow::{Result, anyhow};
-use std::process::{Command, Child};
-use std::env;
-use std::path::PathBuf;
+use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::{info, warn, debug};
+use std::time::{Duration, Instant};
+use tracing::{debug, info, warn};
 
 static COMPOSITOR_RUNNING: AtomicBool = AtomicBool::new(false);
+const SESSION_METADATA_FILE: &str = "remote-desktop-headless-session.json";
 
-/// Virtual display configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeadlessSessionInfo {
+    pub compositor: String,
+    pub runtime_dir: String,
+    pub wayland_display: String,
+    pub sway_socket: String,
+    pub output_name: String,
+    pub width: u32,
+    pub height: u32,
+    pub refresh_rate: u32,
+}
+
+impl HeadlessSessionInfo {
+    pub fn apply_to_command(&self, cmd: &mut Command) {
+        cmd.env("XDG_RUNTIME_DIR", &self.runtime_dir)
+            .env("WAYLAND_DISPLAY", &self.wayland_display)
+            .env("SWAYSOCK", &self.sway_socket)
+            .env("XDG_SESSION_TYPE", "wayland")
+            .env("XDG_CURRENT_DESKTOP", "sway")
+            .env("GDK_BACKEND", "wayland")
+            .env("QT_QPA_PLATFORM", "wayland")
+            .env_remove("DISPLAY");
+    }
+}
+
+/// Headless session configuration and process ownership.
 pub struct VirtualDisplay {
     width: u32,
     height: u32,
     refresh_rate: u32,
     compositor: Option<Child>,
-    wayland_display: Option<String>,
+    session: Option<HeadlessSessionInfo>,
 }
 
 impl VirtualDisplay {
-    /// Create a new virtual display configuration
     pub fn new(width: u32, height: u32, refresh_rate: u32) -> Self {
         Self {
             width,
             height,
             refresh_rate,
             compositor: None,
-            wayland_display: None,
+            session: None,
         }
     }
 
-    /// Start the virtual display (headless compositor)
-    pub fn start(&mut self) -> Result<String> {
-        info!("Starting virtual display ({}x{}@{}Hz)", self.width, self.height, self.refresh_rate);
+    /// Start the dedicated headless sway session and persist its metadata so
+    /// other commands can launch applications into it.
+    pub fn start(&mut self) -> Result<HeadlessSessionInfo> {
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+            .context("XDG_RUNTIME_DIR is required to run the headless Wayland session")?;
+        let runtime_path = Path::new(&runtime_dir);
 
-        // Generate a unique WAYLAND_DISPLAY name
-        let display_num = std::process::id() % 1000;
-        let wayland_display = format!("wayland-{}", display_num);
-
-        // Try different compositors in order of preference
-        let result = self.try_start_cage(&wayland_display)
-            .or_else(|_| self.try_start_weston(&wayland_display))
-            .or_else(|_| self.try_start_sway(&wayland_display));
-
-        match result {
-            Ok(()) => {
-                self.wayland_display = Some(wayland_display.clone());
-                COMPOSITOR_RUNNING.store(true, Ordering::SeqCst);
-                info!("Virtual display started on {}", wayland_display);
-                Ok(wayland_display)
-            }
-            Err(e) => {
-                Err(anyhow!("Failed to start any headless compositor: {}. Install cage, weston, or sway.", e))
-            }
-        }
-    }
-
-    /// Try to start cage (simple kiosk compositor)
-    fn try_start_cage(&mut self, wayland_display: &str) -> Result<()> {
-        // Check if cage is installed
-        let cage_path = which::which("cage")
-            .map_err(|_| anyhow!("cage not found"))?;
-
-        info!("Found cage at {:?}", cage_path);
-
-        // Start cage in headless mode with a dummy client
-        let mut cmd = Command::new(&cage_path);
-        cmd.env("WAYLAND_DISPLAY", wayland_display);
-
-        // cage needs a client to run - we'll use a simple sleep or wayland-info
-        // For headless operation, we run cage with -- backend flag if available
-        // Recent versions of cage support headless via WLR_BACKENDS
-        cmd.env("WLR_BACKENDS", "headless");
-        cmd.env("WLR_LIBINPUT_NO_DEVICES", "1");
-
-        // Set the resolution via cage arguments or environment
-        cmd.arg("--");
-
-        // Run a simple client that keeps the compositor alive
-        // We'll use sleep infinity or a simple wayland client
-        cmd.args(["sleep", "infinity"]);
-
-        info!("Starting cage headless compositor...");
-        let child = cmd.spawn()
-            .map_err(|e| anyhow!("Failed to start cage: {}", e))?;
-
-        self.compositor = Some(child);
-
-        // Wait a moment for the compositor to start
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        Ok(())
-    }
-
-    /// Try to start weston (reference Wayland compositor)
-    fn try_start_weston(&mut self, wayland_display: &str) -> Result<()> {
-        let weston_path = which::which("weston")
-            .map_err(|_| anyhow!("weston not found"))?;
-
-        info!("Found weston at {:?}", weston_path);
-
-        // Create a weston.ini for headless operation
-        let config_dir = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("remote-desktop");
-
-        std::fs::create_dir_all(&config_dir)?;
-        let config_path = config_dir.join("weston.ini");
-
-        let config_content = format!(r#"[core]
-backend=headless-backend.so
-shell=desktop-shell.so
-
-[output]
-name=virtual
-mode={}x{}
-"#, self.width, self.height);
-
-        std::fs::write(&config_path, config_content)?;
-
-        let mut cmd = Command::new(&weston_path);
-        cmd.env("WAYLAND_DISPLAY", wayland_display);
-        cmd.arg("--config");
-        cmd.arg(&config_path);
-        cmd.arg("--socket");
-        cmd.arg(wayland_display);
-
-        info!("Starting weston headless compositor...");
-        let child = cmd.spawn()
-            .map_err(|e| anyhow!("Failed to start weston: {}", e))?;
-
-        self.compositor = Some(child);
-
-        // Wait for weston to initialize
-        std::thread::sleep(std::time::Duration::from_millis(1000));
-
-        Ok(())
-    }
-
-    /// Try to start sway (i3-compatible Wayland compositor)
-    fn try_start_sway(&mut self, wayland_display: &str) -> Result<()> {
         let sway_path = which::which("sway")
-            .map_err(|_| anyhow!("sway not found"))?;
+            .context("Headless mode requires sway to be installed")?;
+        let before_wayland = list_wayland_sockets(runtime_path)?;
+        let config_path = self.write_sway_config()?;
 
-        info!("Found sway at {:?}", sway_path);
-
-        // Create a minimal sway config
-        let config_dir = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("remote-desktop");
-
-        std::fs::create_dir_all(&config_dir)?;
-        let config_path = config_dir.join("sway_config");
-
-        let config_content = r#"# Minimal sway config for virtual display
-# Disable workspace auto_back_and_forth
-workspace_auto_back_and_forth no
-
-# No bars or decorations
-default_border none
-default_floating_border none
-
-# Don't show window titles
-font pango:monospace 0
-
-# Exit handler
-bindsym Mod4+Shift+e exec swaynag -t warning -m 'Exit sway?' -b 'Yes' 'swaymsg exit'
-"#;
-
-        std::fs::write(&config_path, config_content)?;
+        info!(
+            "Starting headless sway session ({}x{}@{}Hz)",
+            self.width, self.height, self.refresh_rate
+        );
 
         let mut cmd = Command::new(&sway_path);
-        cmd.env("WAYLAND_DISPLAY", wayland_display);
-        cmd.env("WLR_BACKENDS", "headless");
-        cmd.env("WLR_LIBINPUT_NO_DEVICES", "1");
-        cmd.arg("--config");
-        cmd.arg(&config_path);
+        cmd.env("XDG_RUNTIME_DIR", &runtime_dir)
+            .env("WLR_BACKENDS", "headless")
+            .env("WLR_LIBINPUT_NO_DEVICES", "1")
+            .env("XDG_SESSION_TYPE", "wayland")
+            .env("XDG_CURRENT_DESKTOP", "sway")
+            .env_remove("DISPLAY")
+            .arg("--unsupported-gpu")
+            .arg("--config")
+            .arg(&config_path);
 
-        info!("Starting sway headless compositor...");
-        let child = cmd.spawn()
-            .map_err(|e| anyhow!("Failed to start sway: {}", e))?;
+        let child = cmd
+            .spawn()
+            .with_context(|| format!("Failed to start sway via {:?}", sway_path))?;
+
+        let sway_socket = format!(
+            "{}/sway-ipc.{}.{}.sock",
+            runtime_dir,
+            unsafe { libc::geteuid() },
+            child.id()
+        );
 
         self.compositor = Some(child);
+        wait_for_path(
+            Path::new(&sway_socket),
+            self.compositor.as_mut(),
+            Duration::from_secs(5),
+            "sway IPC socket",
+        )?;
 
-        // Wait for sway to initialize and create virtual output
-        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let wayland_display = wait_for_wayland_socket(
+            runtime_path,
+            &before_wayland,
+            self.compositor.as_mut(),
+            Duration::from_secs(5),
+        )?;
 
-        // Create a virtual output in sway
-        if let Ok(swaymsg) = which::which("swaymsg") {
-            let output_cmd = Command::new(swaymsg)
-                .env("WAYLAND_DISPLAY", wayland_display)
-                .args(["output", &format!("create mode {}x{}@{}Hz",
-                    self.width, self.height, self.refresh_rate)])
-                .output();
+        let output_name = self.configure_sway_headless_output(&sway_socket)?;
 
-            match output_cmd {
-                Ok(o) if o.status.success() => {
-                    info!("Created virtual output in sway");
-                }
-                _ => {
-                    warn!("Could not create virtual output in sway, using default");
-                }
-            }
-        }
+        let session = HeadlessSessionInfo {
+            compositor: "sway".to_string(),
+            runtime_dir,
+            wayland_display,
+            sway_socket,
+            output_name,
+            width: self.width,
+            height: self.height,
+            refresh_rate: self.refresh_rate,
+        };
 
-        Ok(())
+        write_session_metadata(&session)?;
+        self.session = Some(session.clone());
+        COMPOSITOR_RUNNING.store(true, Ordering::SeqCst);
+
+        info!(
+            "Headless sway session ready on {} ({})",
+            session.wayland_display, session.output_name
+        );
+
+        Ok(session)
     }
 
-    /// Get the WAYLAND_DISPLAY for this virtual display
-    pub fn wayland_display(&self) -> Option<&str> {
-        self.wayland_display.as_deref()
+    fn write_sway_config(&self) -> Result<PathBuf> {
+        let config_dir = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("remote-desktop");
+        fs::create_dir_all(&config_dir)?;
+
+        let config_path = config_dir.join("sway_headless.conf");
+        let config = r#"
+focus_follows_mouse no
+default_border pixel 1
+exec_always dbus-update-activation-environment --systemd WAYLAND_DISPLAY SWAYSOCK XDG_CURRENT_DESKTOP=sway
+"#;
+
+        fs::write(&config_path, config)?;
+        Ok(config_path)
     }
 
-    /// Check if the compositor is still running
+    fn configure_sway_headless_output(&mut self, sway_socket: &str) -> Result<String> {
+        run_swaymsg(sway_socket, &["create_output"])
+            .context("Failed to create headless sway output")?;
+
+        let output_name = wait_for_headless_output(
+            sway_socket,
+            self.compositor.as_mut(),
+            Duration::from_secs(5),
+        )?;
+
+        let mode = format!("{}x{}@{}Hz", self.width, self.height, self.refresh_rate);
+        run_swaymsg(sway_socket, &["output", &output_name, "resolution", &mode]).with_context(
+            || format!("Failed to set sway output {} to {}", output_name, mode),
+        )?;
+
+        run_swaymsg(sway_socket, &["workspace", "1", "output", &output_name]).with_context(
+            || format!("Failed to bind workspace 1 to {}", output_name),
+        )?;
+
+        Ok(output_name)
+    }
+
+    #[allow(dead_code)]
+    pub fn session(&self) -> Option<&HeadlessSessionInfo> {
+        self.session.as_ref()
+    }
+
+    #[allow(dead_code)]
     pub fn is_running(&mut self) -> bool {
         if let Some(ref mut child) = self.compositor {
             match child.try_wait() {
-                Ok(None) => true, // Still running
+                Ok(None) => true,
                 Ok(Some(status)) => {
-                    warn!("Compositor exited with status: {}", status);
+                    warn!("Headless compositor exited with status: {}", status);
                     false
                 }
                 Err(e) => {
@@ -233,52 +203,256 @@ bindsym Mod4+Shift+e exec swaynag -t warning -m 'Exit sway?' -b 'Yes' 'swaymsg e
             false
         }
     }
-
-    /// Get the display dimensions
-    pub fn dimensions(&self) -> (u32, u32) {
-        (self.width, self.height)
-    }
 }
 
 impl Drop for VirtualDisplay {
     fn drop(&mut self) {
+        let _ = remove_session_metadata();
+
         if let Some(ref mut child) = self.compositor {
-            info!("Stopping virtual display compositor...");
+            info!("Stopping headless sway session...");
             let _ = child.kill();
             let _ = child.wait();
         }
+
         COMPOSITOR_RUNNING.store(false, Ordering::SeqCst);
     }
 }
 
-/// Check if any supported headless compositor is available
 pub fn check_compositor_available() -> Result<String> {
-    if which::which("cage").is_ok() {
-        return Ok("cage".to_string());
-    }
-    if which::which("weston").is_ok() {
-        return Ok("weston".to_string());
-    }
-    if which::which("sway").is_ok() {
-        return Ok("sway".to_string());
-    }
-
-    Err(anyhow!("No headless Wayland compositor found. Install one of: cage, weston, or sway"))
+    which::which("sway").context("Install sway for the dedicated headless session runtime")?;
+    which::which("swaymsg").context("Install swaymsg alongside sway for runtime control")?;
+    which::which("grim").context("Install grim for headless session capture")?;
+    Ok("sway".to_string())
 }
 
-/// List available compositors
+#[allow(dead_code)]
 pub fn list_available_compositors() -> Vec<&'static str> {
     let mut available = Vec::new();
 
-    if which::which("cage").is_ok() {
-        available.push("cage (recommended)");
-    }
-    if which::which("weston").is_ok() {
-        available.push("weston");
-    }
-    if which::which("sway").is_ok() {
-        available.push("sway");
+    if which::which("sway").is_ok() && which::which("grim").is_ok() {
+        available.push("sway (recommended)");
     }
 
     available
+}
+
+pub fn session_metadata_path() -> Result<PathBuf> {
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    Ok(Path::new(&runtime_dir).join(SESSION_METADATA_FILE))
+}
+
+pub fn read_session_metadata() -> Result<Option<HeadlessSessionInfo>> {
+    let path = session_metadata_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let data = fs::read(&path)
+        .with_context(|| format!("Failed to read headless session metadata from {:?}", path))?;
+    let session = serde_json::from_slice(&data)
+        .with_context(|| format!("Failed to parse headless session metadata in {:?}", path))?;
+
+    Ok(Some(session))
+}
+
+pub fn write_session_metadata(session: &HeadlessSessionInfo) -> Result<()> {
+    let path = session_metadata_path()?;
+    let data = serde_json::to_vec_pretty(session)?;
+    fs::write(&path, data)
+        .with_context(|| format!("Failed to write headless session metadata to {:?}", path))?;
+    Ok(())
+}
+
+pub fn remove_session_metadata() -> Result<()> {
+    let path = session_metadata_path()?;
+    if path.exists() {
+        fs::remove_file(&path)
+            .with_context(|| format!("Failed to remove headless session metadata at {:?}", path))?;
+    }
+    Ok(())
+}
+
+pub fn launch_in_headless_session(command: &[String]) -> Result<()> {
+    if command.is_empty() {
+        return Err(anyhow!("No command provided to launch"));
+    }
+
+    let session = read_session_metadata()?
+        .ok_or_else(|| anyhow!("No active headless session found. Start the server with --virtual first."))?;
+
+    let mut child = Command::new(&command[0]);
+    child.args(&command[1..]);
+    session.apply_to_command(&mut child);
+
+    let child = child
+        .spawn()
+        .with_context(|| format!("Failed to launch {:?} in the headless session", command))?;
+
+    info!(
+        "Launched {:?} in headless session on {} (pid={})",
+        command,
+        session.output_name,
+        child.id()
+    );
+
+    Ok(())
+}
+
+fn list_wayland_sockets(runtime_dir: &Path) -> Result<BTreeSet<String>> {
+    let mut sockets = BTreeSet::new();
+    for entry in fs::read_dir(runtime_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("wayland-") {
+            sockets.insert(name);
+        }
+    }
+    Ok(sockets)
+}
+
+fn wait_for_wayland_socket(
+    runtime_dir: &Path,
+    before: &BTreeSet<String>,
+    compositor: Option<&mut Child>,
+    timeout: Duration,
+) -> Result<String> {
+    let start = Instant::now();
+    let mut compositor = compositor;
+
+    loop {
+        let current = list_wayland_sockets(runtime_dir)?;
+        if let Some(socket) = current.iter().find(|socket| !before.contains(socket.as_str())) {
+            return Ok(socket.clone());
+        }
+
+        if let Some(child) = compositor.as_mut() {
+            if let Some(status) = child.try_wait()? {
+                return Err(anyhow!(
+                    "Headless compositor exited before creating a Wayland socket: {}",
+                    status
+                ));
+            }
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(anyhow!("Timed out waiting for the headless Wayland socket"));
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_path(
+    path: &Path,
+    compositor: Option<&mut Child>,
+    timeout: Duration,
+    description: &str,
+) -> Result<()> {
+    let start = Instant::now();
+    let mut compositor = compositor;
+
+    loop {
+        if path.exists() {
+            return Ok(());
+        }
+
+        if let Some(child) = compositor.as_mut() {
+            if let Some(status) = child.try_wait()? {
+                return Err(anyhow!(
+                    "Headless compositor exited before {} became available: {}",
+                    description,
+                    status
+                ));
+            }
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(anyhow!("Timed out waiting for {}", description));
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_headless_output(
+    sway_socket: &str,
+    compositor: Option<&mut Child>,
+    timeout: Duration,
+) -> Result<String> {
+    let start = Instant::now();
+    let mut compositor = compositor;
+
+    loop {
+        if let Ok(outputs) = get_sway_outputs(sway_socket) {
+            if let Some(output) = outputs
+                .into_iter()
+                .find(|output| output.name.starts_with("HEADLESS-"))
+            {
+                return Ok(output.name);
+            }
+        }
+
+        if let Some(child) = compositor.as_mut() {
+            if let Some(status) = child.try_wait()? {
+                return Err(anyhow!(
+                    "Headless compositor exited before exposing a headless output: {}",
+                    status
+                ));
+            }
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(anyhow!("Timed out waiting for sway to expose HEADLESS-* output"));
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn run_swaymsg(sway_socket: &str, args: &[&str]) -> Result<()> {
+    let swaymsg = which::which("swaymsg")
+        .context("swaymsg is required to control the headless sway session")?;
+
+    debug!("Running swaymsg {:?}", args);
+    let output = Command::new(swaymsg)
+        .args(["--socket", sway_socket])
+        .args(args)
+        .output()
+        .with_context(|| format!("Failed to run swaymsg {:?}", args))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "swaymsg {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct SwayOutput {
+    name: String,
+}
+
+fn get_sway_outputs(sway_socket: &str) -> Result<Vec<SwayOutput>> {
+    let swaymsg = which::which("swaymsg")
+        .context("swaymsg is required to query headless sway outputs")?;
+    let output = Command::new(swaymsg)
+        .args(["--socket", sway_socket, "-r", "-t", "get_outputs"])
+        .output()
+        .context("Failed to query sway outputs")?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "swaymsg get_outputs failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let outputs = serde_json::from_slice(&output.stdout)
+        .context("Failed to parse sway output list")?;
+    Ok(outputs)
 }
