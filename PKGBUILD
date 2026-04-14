@@ -1,78 +1,53 @@
 # Maintainer: Your Name <your.email@example.com>
-pkgname=remote-desktop-wayland
+pkgname=wayscreenpass
 pkgver=0.1.0
 pkgrel=1
-pkgdesc="Custom remote desktop for KDE Plasma Wayland with Tailscale-only access"
+pkgdesc="Headless Wayland remote desktop over Tailscale"
 arch=(x86_64)
-url="https://github.com/your/remote-desktop-wayland"
-license=('MIT' OR 'Apache-2.0')
+url="https://github.com/noonr48/WayScreenPass"
+license=('MIT' 'Apache-2.0')
 depends=(
-    # Runtime dependencies
-    'pipewire' 'wireplumber'
-    'xdg-desktop-portal-kde'
     'tailscale'
     'nftables'
-    'libei'
+    'sway'
+    'grim'
+    'wl-clipboard'
+    'x264'
     'ffmpeg'
-    'gcc-libs' 'glibc'
+    'sdl2'
+    'gcc-libs'
+    'glibc'
 )
 makedepends=('cargo' 'rust')
-optdepends=(
-    'krfb: Alternative VNC backend'
-)
-backup=(
-    'etc/remote-desktop/config.toml'
-)
-
-prepare() {
-    cd "$srcdir"
-    if [ -d "$pkgname" ]; then
-        rm -rf "$pkgname"
-    fi
-    cp -r "$startdir/$pkgname" "$pkgname"
-    cd "$pkgname"
-
-    export RUSTUP_TOOLCHAIN=stable
-    cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
-}
+source=("$pkgname::git+$url.git")
+sha256sums=('SKIP')
 
 build() {
     cd "$srcdir/$pkgname"
     export RUSTUP_TOOLCHAIN=stable
-    export CARGO_TARGET_DIR=target
-    cargo build --frozen --release --all-features
+    cargo build --frozen --release --workspace
 }
 
 check() {
     cd "$srcdir/$pkgname"
     export RUSTUP_TOOLCHAIN=stable
-    cargo test --frozen --all-features
+    cargo test --frozen --workspace
 }
 
 package() {
     cd "$srcdir/$pkgname"
 
-    # Install binaries
     install -Dm755 "target/release/remote-desktop-server" "$pkgdir/usr/bin/remote-desktop-server"
     install -Dm755 "target/release/remote-desktop" "$pkgdir/usr/bin/remote-desktop"
+    install -Dm755 "target/release/remote-desktop-tray" "$pkgdir/usr/bin/remote-desktop-tray"
 
-    # Install systemd units
     install -Dm644 "systemd/remote-desktop.service" \
         "$pkgdir/usr/lib/systemd/user/remote-desktop.service"
-    install -Dm644 "systemd/remote-desktop.socket" \
-        "$pkgdir/usr/lib/systemd/user/remote-desktop.socket"
 
-    # Install nftables rules
     install -Dm644 "nftables-rules.conf" \
-        "$pkgdir/etc/nftables.d/remote-desktop.conf"
+        "$pkgdir/usr/share/$pkgname/nftables-rules.conf"
 
-    # Install example config
-    install -Dm644 "config/remote-desktop.conf.example" \
-        "$pkgdir/etc/remote-desktop/config.toml.example"
-
-    # Install documentation
     install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
-    install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
 
 # vim:set ts=2 sw=2 et:

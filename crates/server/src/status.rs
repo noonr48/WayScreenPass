@@ -95,25 +95,12 @@ pub fn display_status() -> Result<()> {
         println!();
     }
 
-    // Show portal status
-    println!("Portal Status:");
-    if is_portal_running() {
-        println!("  🟢 xdg-desktop-portal is running");
-    } else {
-        println!("  🔴 xdg-desktop-portal is not running");
-    }
-
-    // Show uinput status
-    println!();
     println!("Input Injection:");
     if headless_session.is_some() {
-        println!("  ℹ️  Headless mode currently uses the safe stub backend");
-        println!("     A dedicated wlroots virtual-input backend still needs to be implemented");
-    } else if is_uinput_accessible() {
-        println!("  🟢 /dev/uinput is accessible");
+        println!("  🟢 Wayland virtual keyboard + pointer");
+        println!("     Scoped to the dedicated headless session socket");
     } else {
-        println!("  🔴 /dev/uinput is not accessible");
-        println!("     Run 'remote-desktop-server setup' for help");
+        println!("  ℹ️  Input backend becomes available once the headless session starts");
     }
 
     println!();
@@ -175,34 +162,4 @@ fn get_tailscale_ip() -> Result<String> {
     }
 
     Err(anyhow!("Tailscale IP not found"))
-}
-
-/// Check if xdg-desktop-portal is running
-fn is_portal_running() -> bool {
-    let output = Command::new("pgrep")
-        .arg("-f")
-        .arg("xdg-desktop-portal")
-        .output();
-
-    if let Ok(output) = output {
-        return output.status.success() && !output.stdout.is_empty();
-    }
-    false
-}
-
-/// Check if /dev/uinput is accessible
-fn is_uinput_accessible() -> bool {
-    let uinput_path = Path::new("/dev/uinput");
-
-    if !uinput_path.exists() {
-        return false;
-    }
-
-    // Try to open for read/write
-    use std::fs::OpenOptions;
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(uinput_path)
-        .is_ok()
 }

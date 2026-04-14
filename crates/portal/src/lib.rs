@@ -1,6 +1,6 @@
 //! Remote Desktop Portal Integration
 //!
-//! Handles xdg-desktop-portal session management and libei input injection.
+//! Handles clipboard sync, optional portal session management, and headless Wayland input.
 
 mod session;
 mod input;

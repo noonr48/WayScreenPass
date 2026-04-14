@@ -2,7 +2,7 @@
 #
 # This is a Cargo workspace with multiple crates:
 # - core: Shared library (monitor detection, protocol, encoder)
-# - portal: Portal integration (ashpd, input injection)
+# - portal: Headless session helpers (input, clipboard, optional portal support)
 # - server: Server binary (remote-desktop-server)
 # - client: Client binary (remote-desktop)
 #
@@ -24,19 +24,19 @@ rust-version = "1.85"
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }
 
-# Portal and PipeWire
+# Headless session input helpers and optional portal/PipeWire support
 ashpd = { version = "0.10", features = ["wayland"] }
 pipewire = "0.8"
+wayland-client = "0.31"
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+xkbcommon = "0.9"
 
 # DRM for monitor detection
 drm = "0.6"
 
 # Video encoding (software - unified for all GPUs)
 ffmpeg-next = "8.0"
-
-# Note: libei is not yet on crates.io
-# For now, we'll define the input event structures
-# Full libei integration can be added later when available
 
 # Protocol (custom)
 bytes = "1.7"
@@ -66,6 +66,7 @@ glob = "0.3"
 async-trait = "0.1"
 futures = "0.3"
 futures-util = { version = "0.3", features = ["sink"] }
+tempfile = "3.13"
 
 # Hashing for clipboard change detection
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

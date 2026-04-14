@@ -2,165 +2,125 @@
 
 Headless Wayland remote desktop over Tailscale.
 
-WayScreenPass runs a dedicated headless Wayland session on the remote machine, captures that session with `grim`, streams it as H.264 over Tailscale, and lets you launch applications into the remoted desktop without relying on a portal prompt for each connection.
+WayScreenPass starts a dedicated headless Sway session on the remote machine, captures that session with `grim`, encodes H.264 through a persistent `x264` process, and streams it to the client over Tailscale. The supported server model is now **headless-only**: it does not depend on xdg-desktop-portal approval prompts and does not try to remote the live local desktop.
+
+## Current Status
+
+- **Implemented:** headless session startup, video streaming, app launch, clipboard sync, and input injection.
+- **Input path:** keyboard and pointer control target the dedicated session through Wayland virtual keyboard/pointer protocols.
+- **Deployment:** setup guidance, status output, and packaged systemd service are aligned with unattended boot/loginless use.
+- **Validated:** `cargo test --workspace` and `cargo build --release` both pass.
+- **Still recommended:** a live smoke test on the target machine to confirm compositor/runtime specifics.
 
 ## Architecture
 
-```
+```text
 CLIENT (your machine)                    SERVER (remote machine)
 ┌──────────────────────┐                ┌──────────────────────────────┐
 │ SDL2 Window          │                │ Headless Sway Session        │
-│ H.264 Decoder (ffmpeg)│◄──TCP 3389──►│ H.264 Encoder (persistent x264)│
-│ Keyboard/Mouse Input │  (Tailscale)   │ grim PNG capture → RGB24     │
-│ Clipboard Sync       │                │ Clipboard Sync (wl-clipboard)│
-└──────────────────────┘                └──────────────────────────────┘
+│ H.264 Decoder        │◄──TCP 3389──►│ grim capture -> RGB24        │
+│ Keyboard/Mouse Input │  (Tailscale)   │ x264 encoder (persistent)    │
+│ Clipboard Sync       │                │ Wayland virtual input        │
+└──────────────────────┘                │ wl-clipboard sync            │
+                                        └──────────────────────────────┘
 ```
 
-## Features
+## What You Get
 
-- **Headless session model** — dedicated remoted desktop on the same machine and user account
-- **No per-connection portal prompt** — headless mode avoids repeated screen-share approval dialogs
-- **Persistent x264 encoder** — single process, NAL unit parser, no per-frame fork
-- **Real monitor detection** — reads `/sys/class/drm/` sysfs for actual connected displays
-- **Headless app launch** — `remote-desktop-server launch <command>` starts apps inside the remoted session
-- **Proper input injection** — uinput remains available for the physical-session path
-- **Correct keycode mapping** — SDL2 scancodes translated to Linux evdev codes (80+ keys)
-- **Bidirectional clipboard** — event-driven via `wl-paste --watch`, supports text/html/image
-- **Auto-reconnection** — client reconnects with exponential backoff on disconnect
-- **Graceful shutdown** — SIGTERM/SIGINT signal handling with PID file cleanup
-- **Dedicated headless compositor** — sway + grim based session runtime
-- **Tailscale-only security** — nftables + IP verification (100.x.y.z range)
-- **Adaptive quality** — 5 quality levels from 1080p@8Mbps to 576p@1.5Mbps
-- **System tray app** — ksni-based tray for managing remote hosts
+- **Dedicated remoted desktop** on the same machine and user account
+- **No per-connection screen-share prompt**
+- **Wayland-scoped virtual input** for the headless session
+- **App launch inside the remoted session** with `remote-desktop-server launch`
+- **Bidirectional clipboard sync**
+- **Persistent x264 encoding** instead of per-frame process spawning
+- **Tailscale-first security model**
 
 ## Quick Start
 
-### Build
+### 1. Build
 
 ```bash
 cargo build --release
 ```
 
-### Server Setup (one-time, on remote machine)
+### 2. Install runtime dependencies on the remote machine
+
+Example for Arch/CachyOS:
 
 ```bash
-# 1. Install firewall rules
-sudo nft -f nftables-rules.conf
+sudo pacman -S sway grim wl-clipboard x264 ffmpeg sdl2 tailscale nftables
+```
 
-# 2. Install headless-session runtime
-# Arch/CachyOS:
-sudo pacman -S sway grim
+### 3. Run setup and start the headless server
 
-# 3. Optional: enable uinput for the physical-session path
-sudo modprobe uinput
-sudo usermod -aG input $USER
-echo "uinput" | sudo tee /etc/modules-load.d/uinput.conf
-# Re-login after this
+```bash
+./target/release/remote-desktop-server setup
+./target/release/remote-desktop-server start
+```
 
-# 4. Run setup wizard
-./target/release/remote-desktop-server setup --authorize
+### 4. Optional: enable unattended boot
 
-# 5. Start the headless session server
-./target/release/remote-desktop-server start --virtual
+```bash
+systemctl --user enable --now remote-desktop.service
+sudo loginctl enable-linger "$USER"
+```
 
-# 6. Launch an app into the headless session
+### 5. Launch an application into the headless session
+
+```bash
 ./target/release/remote-desktop-server launch foot
 ```
 
-### Connect (from your machine)
+### 6. Connect from your machine
 
 ```bash
-# List monitors on remote
 ./target/release/remote-desktop connect <tailscale-hostname> --list
-
-# Connect (auto-selects the headless output)
 ./target/release/remote-desktop connect <tailscale-hostname>
+```
 
-# Connect to specific monitor
+To target the explicit headless output:
+
+```bash
 ./target/release/remote-desktop connect <tailscale-hostname> --monitor HEADLESS-1
 ```
 
-### System Tray
+## Useful Server Commands
 
 ```bash
-# Add a host
-./target/release/remote-desktop-tray add mypc 100.77.233.119
-
-# Launch tray icon
-./target/release/remote-desktop-tray
+./target/release/remote-desktop-server status
+./target/release/remote-desktop-server list-monitors
+./target/release/remote-desktop-server launch <command> [args...]
 ```
 
-### Headless Session Mode
+## Crate Layout
 
-```bash
-# Requires: sway, swaymsg, grim
-sudo pacman -S sway grim
+| Crate | Purpose |
+|-------|---------|
+| `core` | Shared protocol, encoder, monitor/capture helpers |
+| `portal` | Headless input backend, clipboard helpers, retained portal session code |
+| `server` | Headless session runtime, TCP server, setup/status commands |
+| `client` | SDL2 client, decoder, input capture |
+| `tray` | System tray frontend for saved hosts |
 
-./target/release/remote-desktop-server start --virtual
-
-# Launch another application into the remoted desktop
-./target/release/remote-desktop-server launch alacritty
-```
-
-## Configuration
-
-`~/.config/remote-desktop/config.toml`:
-
-```toml
-[network]
-port = 3389
-
-[video]
-fps = 30
-quality = 23
-
-[monitor]
-auto_select_primary = true
-```
-
-## Crate Structure
-
-| Crate | Type | Purpose |
-|-------|------|---------|
-| `core` | lib | Protocol, encoder, optional PipeWire capture, monitor detection |
-| `portal` | lib | Optional portal sessions, input injection (evdev), clipboard |
-| `server` | bin | TCP server, connection handler, headless session runtime |
-| `client` | bin | TCP client, SDL2 display, ffmpeg decoder, input mapping |
-| `tray` | bin | System tray (ksni), host management |
-
-## Dependencies
+## Runtime Dependencies
 
 | Dependency | Purpose |
 |------------|---------|
-| x264 | H.264 encoding (persistent pipe) |
-| sway | Dedicated headless Wayland session |
-| grim | Capture frames from the headless session |
-| ashpd | Optional xdg-desktop-portal integration for physical-session capture |
-| evdev | uinput virtual keyboard/mouse |
-| SDL2 | Client display and input |
-| ffmpeg | Client H.264 decoding |
-| wl-clipboard | Clipboard sync (wl-paste --watch) |
-| Tailscale | Network encryption and auth |
-| nftables | Firewall (Tailscale-only) |
-| PipeWire (optional) | Future portal/physical-session capture path |
-
-## Tests
-
-```bash
-# Run all tests (set WAYLAND_DISPLAY for clipboard/display tests)
-export WAYLAND_DISPLAY=wayland-0
-cargo test --workspace
-
-# 26 tests, 0 failures
-```
+| `sway` | Dedicated headless Wayland session |
+| `grim` | Frame capture from the headless output |
+| `wl-clipboard` | Clipboard sync |
+| `x264` | H.264 encoding |
+| `ffmpeg` | Client-side decoding |
+| `SDL2` | Client window and input capture |
+| `Tailscale` | Network security and access |
+| `nftables` | Optional Tailscale-only firewall policy |
 
 ## Security Model
 
-- **Network**: Tailscale-only (100.x.y.z CGNAT range verified per-connection)
-- **Encryption**: WireGuard via Tailscale (no app-layer crypto needed)
-- **Authorization**: headless mode avoids per-connection screen-capture prompts by remoting a dedicated session instead of the live desktop
-- **Input**: current default headless build prioritizes safe session launch/capture; uinput remains available for the physical-session path
-- **Firewall**: nftables blocks all non-tailscale0 traffic to port 3389
+- **Network:** Tailscale-only access is the intended deployment model
+- **Desktop isolation:** the remoted desktop is a dedicated headless session, not the live local session
+- **Input scope:** injected input targets the headless session socket, not the whole system
+- **Firewall:** `nftables-rules.conf` can restrict port 3389 to `tailscale0`
 
 ## License
 

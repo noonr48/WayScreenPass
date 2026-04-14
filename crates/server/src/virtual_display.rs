@@ -279,7 +279,7 @@ pub fn launch_in_headless_session(command: &[String]) -> Result<()> {
     }
 
     let session = read_session_metadata()?
-        .ok_or_else(|| anyhow!("No active headless session found. Start the server with --virtual first."))?;
+        .ok_or_else(|| anyhow!("No active headless session found. Start the server first."))?;
 
     let mut child = Command::new(&command[0]);
     child.args(&command[1..]);

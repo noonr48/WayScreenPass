@@ -5,7 +5,7 @@
 use crate::virtual_display::HeadlessSessionInfo;
 use image::ImageFormat;
 use remote_desktop_core::*;
-use remote_desktop_portal::{InputHandler, InputBackend, SessionManager, KeyEvent as PortalKeyEvent, KeyState as PortalKeyState,
+use remote_desktop_portal::{InputHandler, InputBackend, KeyEvent as PortalKeyEvent, KeyState as PortalKeyState,
                             PointerEvent as PortalPointerEvent, ButtonState as PortalButtonState, ClipboardHandler};
 use std::process::Command;
 use std::sync::Arc;
@@ -29,10 +29,8 @@ struct VideoFrameToSend {
 pub struct ServerState {
     pub clients: Arc<Mutex<std::collections::HashMap<String, ClientInfo>>>,
     pub input_handler: Arc<Mutex<Option<InputHandler>>>,
-    pub portal_node_id: Arc<Mutex<Option<u32>>>,
     pub clipboard: Arc<Mutex<Option<ClipboardHandler>>>,
     pub clipboard_enabled: bool,
-    pub virtual_mode: Arc<Mutex<bool>>,
     pub headless_session: Arc<Mutex<Option<HeadlessSessionInfo>>>,
 }
 
@@ -41,10 +39,8 @@ impl ServerState {
         Self {
             clients: Arc::new(Mutex::new(std::collections::HashMap::new())),
             input_handler: Arc::new(Mutex::new(None)),
-            portal_node_id: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
             clipboard_enabled: true,
-            virtual_mode: Arc::new(Mutex::new(false)),
             headless_session: Arc::new(Mutex::new(None)),
         }
     }
@@ -53,16 +49,6 @@ impl ServerState {
     pub fn with_clipboard(mut self, enabled: bool) -> Self {
         self.clipboard_enabled = enabled;
         self
-    }
-
-    pub fn set_virtual_mode(&self, enabled: bool) {
-        if let Ok(mut guard) = self.virtual_mode.try_lock() {
-            *guard = enabled;
-        }
-    }
-
-    pub async fn is_virtual_mode(&self) -> bool {
-        *self.virtual_mode.lock().await
     }
 
     pub async fn set_headless_session(&self, session: Option<HeadlessSessionInfo>) {
@@ -76,7 +62,7 @@ impl ServerState {
     pub async fn init_input_handler(&self, backend: InputBackend) {
         let mut handler_guard = self.input_handler.lock().await;
         if handler_guard.is_none() {
-            match InputHandler::new(backend) {
+            match InputHandler::new(backend.clone()) {
                 Ok(handler) => {
                     *handler_guard = Some(handler);
                     info!("Input handler initialized with {:?} backend", backend);
@@ -86,23 +72,6 @@ impl ServerState {
                 }
             }
         }
-    }
-
-    pub async fn init_portal_session(&self) -> anyhow::Result<u32> {
-        let mut node_id_guard = self.portal_node_id.lock().await;
-        if let Some(node_id) = *node_id_guard {
-            return Ok(node_id);
-        }
-
-        info!("Creating portal session for screen capture");
-        let manager = SessionManager::new().await?;
-        let session = manager.create_persistent_session().await?;
-        let node_id = session.pipewire_node_id();
-
-        *node_id_guard = Some(node_id);
-        info!("Portal session created, node ID: {}", node_id);
-
-        Ok(node_id)
     }
 
     pub async fn init_clipboard(&self) {
@@ -142,7 +111,6 @@ pub struct ClientInfo {
     pub connected_at: std::time::Instant,
     pub selected_monitor: Option<String>,
     pub current_quality: QualityLevel,
-    pub pipewire_node_id: Option<u32>,
     pub stream_width: u16,
     pub stream_height: u16,
 }
@@ -447,7 +415,6 @@ async fn handle_client_message(
                 connected_at: std::time::Instant::now(),
                 selected_monitor: None,
                 current_quality: *quality,
-                pipewire_node_id: None, // Will be set when stream starts
                 stream_width: 1920,
                 stream_height: 1080,
             });
@@ -480,34 +447,18 @@ async fn handle_client_message(
         ClientMessage::SelectMonitor(sel) => {
             info!("Client selected monitor: {}", sel.monitor_name);
 
-            let is_virtual = state.is_virtual_mode().await;
-
-            let (monitor_name, stream_width, stream_height) = if is_virtual {
-                let session = state.headless_session().await
-                    .ok_or_else(|| anyhow::anyhow!("Headless session is not available"))?;
-                let monitor = headless_monitor_info(&session);
-                if sel.monitor_name != monitor.name {
-                    return Err(anyhow::anyhow!(
-                        "Headless output not found: {} (available: {})",
-                        sel.monitor_name,
-                        monitor.name
-                    ));
-                }
-                (monitor.name, monitor.width, monitor.height)
-            } else {
-                let monitors = enumerate_monitors()?;
-                let monitor = monitors.iter()
-                    .find(|m| m.name == sel.monitor_name)
-                    .ok_or_else(|| anyhow::anyhow!("Monitor not found: {}", sel.monitor_name))?;
-
-                let (width, height) = sel.requested_width.and_then(|w|
-                    sel.requested_height.map(|h| (w, h))
-                ).unwrap_or_else(|| {
-                    quality.resolution()
-                });
-
-                (monitor.name.clone(), width, height)
-            };
+            let session = state.headless_session().await
+                .ok_or_else(|| anyhow::anyhow!("Headless session is not available"))?;
+            let monitor = headless_monitor_info(&session);
+            if sel.monitor_name != monitor.name {
+                return Err(anyhow::anyhow!(
+                    "Headless output not found: {} (available: {})",
+                    sel.monitor_name,
+                    monitor.name
+                ));
+            }
+            let (monitor_name, stream_width, stream_height) =
+                (monitor.name, monitor.width, monitor.height);
 
             // Update client info
             if let Some(info) = client_info.as_mut() {
@@ -548,48 +499,22 @@ async fn handle_client_message(
 
             // Start video streaming task with channel sender
             let video_tx_clone = video_tx.clone();
-
-            let handle = if is_virtual {
-                let session = state.headless_session().await
-                    .ok_or_else(|| anyhow::anyhow!("Headless session is not available"))?;
-                info!("Using dedicated headless session {}", session.output_name);
-                tokio::spawn(async move {
-                    if let Err(e) = start_virtual_streaming(video_tx_clone, session, fps).await {
-                        error!("Virtual streaming error: {}", e);
-                    }
-                })
-            } else {
-                // Normal mode - use portal session
-                let node_id = match state.init_portal_session().await {
-                    Ok(nid) => Some(nid),
-                    Err(e) => {
-                        warn!("Failed to create portal session: {}, using stub mode", e);
-                        None
-                    }
-                };
-
-                let node_id_for_task = node_id;
-                tokio::spawn(async move {
-                    if let Err(e) = start_video_streaming(
-                        video_tx_clone,
-                        monitor_name,
-                        stream_width,
-                        stream_height,
-                        fps,
-                        node_id_for_task,
-                    ).await {
-                        error!("Video streaming error: {}", e);
-                    }
-                })
-            };
+            let session = state.headless_session().await
+                .ok_or_else(|| anyhow::anyhow!("Headless session is not available"))?;
+            info!("Using dedicated headless session {}", session.output_name);
+            let handle = tokio::spawn(async move {
+                if let Err(e) = start_virtual_streaming(video_tx_clone, session, fps).await {
+                    error!("Video streaming error: {}", e);
+                }
+            });
             *streaming_handle = Some(handle);
         }
 
         ClientMessage::KeyEvent(event) => {
             debug!("Key event: code={}, state={:?}", event.key_code, event.state);
 
-            // Convert protocol event to portal event
-            let portal_event = PortalKeyEvent {
+            // Convert protocol event to the server-side input event format.
+            let input_event = PortalKeyEvent {
                 keycode: event.key_code,
                 state: match event.state {
                     remote_desktop_core::protocol::KeyState::Pressed => PortalKeyState::Pressed,
@@ -599,7 +524,7 @@ async fn handle_client_message(
 
             // Send to input handler if available
             if let Some(handler) = state.input_handler.lock().await.as_mut() {
-                if let Err(e) = handler.send_key(&portal_event) {
+                if let Err(e) = handler.send_key(&input_event) {
                     error!("Failed to send key event: {}", e);
                 }
             }
@@ -608,8 +533,8 @@ async fn handle_client_message(
         ClientMessage::PointerEvent(event) => {
             debug!("Pointer event: type={:?}, x={:?}, y={:?}", event.event_type, event.x, event.y);
 
-            // Convert protocol event to portal event
-            let portal_event = match event.event_type {
+            // Convert protocol event to the server-side input event format.
+            let input_event = match event.event_type {
                 remote_desktop_core::protocol::PointerEventType::Motion => {
                     // Use absolute positioning with normalized coordinates
                     let (sw, sh) = client_info.as_ref()
@@ -640,7 +565,7 @@ async fn handle_client_message(
 
             // Send to input handler if available
             if let Some(handler) = state.input_handler.lock().await.as_mut() {
-                if let Err(e) = handler.send_pointer(&portal_event) {
+                if let Err(e) = handler.send_pointer(&input_event) {
                     error!("Failed to send pointer event: {}", e);
                 }
             }
@@ -716,22 +641,9 @@ async fn handle_client_message(
 async fn list_available_monitors(
     state: &ServerState,
 ) -> anyhow::Result<Vec<remote_desktop_core::protocol::MonitorInfo>> {
-    if state.is_virtual_mode().await {
-        let session = state.headless_session().await
-            .ok_or_else(|| anyhow::anyhow!("Headless session is not available"))?;
-        return Ok(vec![headless_monitor_info(&session)]);
-    }
-
-    Ok(enumerate_monitors()?
-        .into_iter()
-        .map(|m| remote_desktop_core::protocol::MonitorInfo {
-            name: m.name,
-            width: m.resolution.0 as u16,
-            height: m.resolution.1 as u16,
-            refresh_rate: m.refresh_rate as u8,
-            is_primary: m.is_primary,
-        })
-        .collect())
+    let session = state.headless_session().await
+        .ok_or_else(|| anyhow::anyhow!("Headless session is not available"))?;
+    Ok(vec![headless_monitor_info(&session)])
 }
 
 fn headless_monitor_info(
@@ -744,118 +656,6 @@ fn headless_monitor_info(
         refresh_rate: session.refresh_rate as u8,
         is_primary: true,
     }
-}
-
-/// Start video streaming for a monitor
-#[cfg(feature = "portal-capture")]
-async fn start_video_streaming(
-    video_tx: mpsc::UnboundedSender<VideoFrameToSend>,
-    monitor_name: String,
-    width: u16,
-    height: u16,
-    fps: u8,
-    node_id: Option<u32>,
-) -> anyhow::Result<()> {
-    info!("Starting video stream for {} ({}x{}@{}fps)", monitor_name, width, height, fps);
-
-    // Create video stream from portal node ID, or fall back to stub
-    let mut stream = if let Some(nid) = node_id {
-        info!("Using PipeWire node ID: {}", nid);
-        VideoStream::from_node_id(nid, width as u32, height as u32).await?
-    } else {
-        warn!("No portal node ID, using stub mode");
-        VideoStream::new(&monitor_name).await?
-    };
-
-    // Start screen capture
-
-    stream.start(width as u32, height as u32)?;
-
-    // Create encoder
-    let mut encoder = H264Encoder::new(width as u32, height as u32)?;
-
-    let frame_duration_us = 1_000_000 / fps as u64;
-    let mut frame_count = 0u64;
-    let mut last_keyframe = 0u64;
-
-    loop {
-        let start = std::time::Instant::now();
-
-        // Capture frame
-        match stream.capture_frame()? {
-            Some(frame) => {
-                // Calculate stride (RGB24 = 3 bytes per pixel)
-                let stride = frame.width * 3;
-
-                // Encode frame
-                match encoder.encode(&frame.data, stride) {
-                    Ok(encoded) => {
-                        let data_len = encoded.data.len();
-                        let is_keyframe = encoded.is_keyframe;
-
-                        // Determine frame type
-                        let frame_type = if is_keyframe {
-                            FrameType::IFrame
-                        } else {
-                            FrameType::PFrame
-                        };
-
-                        // Send video frame through channel
-                        let _ = video_tx.send(VideoFrameToSend {
-                            frame_type,
-                            timestamp_us: frame_count * frame_duration_us,
-                            data: encoded.data,
-                        });
-
-                        if frame_count % 30 == 0 {
-                            debug!("Encoded frame {}: {} bytes, keyframe={}",
-                                frame_count, data_len, is_keyframe);
-                        }
-
-                        frame_count += 1;
-                        if is_keyframe {
-                            last_keyframe = frame_count;
-                        }
-
-                        // Force keyframe every 2 seconds (at 30fps = every 60 frames)
-                        if frame_count - last_keyframe > 60 {
-                            encoder.request_keyframe()?;
-                            last_keyframe = frame_count;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Encoding error: {}", e);
-                    }
-                }
-            }
-            None => {
-                // No frame available yet - wait a bit
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        }
-
-        // Maintain frame rate
-        let elapsed = start.elapsed().as_micros() as u64;
-        if elapsed < frame_duration_us {
-            tokio::time::sleep(std::time::Duration::from_micros(frame_duration_us - elapsed)).await;
-        }
-    }
-}
-
-/// Start video streaming for a physical monitor in builds without portal
-/// capture support.
-#[cfg(not(feature = "portal-capture"))]
-async fn start_video_streaming(
-    _video_tx: mpsc::UnboundedSender<VideoFrameToSend>,
-    _monitor_name: String,
-    _width: u16,
-    _height: u16,
-    _fps: u8,
-    _node_id: Option<u32>,
-) -> anyhow::Result<()> {
-    Err(anyhow::anyhow!(
-        "This build was compiled without portal capture support. Use --virtual for the headless session mode."
-    ))
 }
 
 /// Start video streaming for the dedicated headless session.

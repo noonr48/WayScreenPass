@@ -13,10 +13,12 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 xxhash-rust = { workspace = true }
+tempfile = { workspace = true }
+wayland-client = { workspace = true }
+wayland-protocols-misc = { workspace = true }
+wayland-protocols-wlr = { workspace = true }
+xkbcommon = { workspace = true }
 
 # For chrono in session.rs
 chrono = "0.4"
 dirs = "5.0"
-
-# Input device handling via evdev
-evdev = "0.13"

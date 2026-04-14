@@ -3,10 +3,6 @@ name = "remote-desktop-server"
 version.workspace = true
 edition.workspace = true
 
-[features]
-default = []
-portal-capture = ["remote-desktop-core/portal-capture"]
-
 [[bin]]
 name = "remote-desktop-server"
 path = "src/main.rs"

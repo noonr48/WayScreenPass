@@ -17,7 +17,7 @@ use virtual_display::{VirtualDisplay, launch_in_headless_session, read_session_m
 
 #[derive(Parser)]
 #[command(name = "remote-desktop-server")]
-#[command(about = "Remote desktop server for Wayland", long_about = None)]
+#[command(about = "Headless Wayland remote desktop server", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -30,10 +30,6 @@ enum Commands {
         /// Port to listen on (default: 3389)
         #[arg(short, long)]
         port: Option<u16>,
-
-        /// Use virtual display (headless mode, no portal approval needed)
-        #[arg(name = "virtual", long)]
-        virtual_display: bool,
 
         /// Virtual display width (default: 1920)
         #[arg(long, default_value = "1920")]
@@ -49,15 +45,7 @@ enum Commands {
     },
 
     /// Run the setup wizard
-    Setup {
-        /// Reset existing authorization
-        #[arg(long)]
-        reset: bool,
-
-        /// Pre-authorize screen capture (avoids prompts on connect)
-        #[arg(long)]
-        authorize: bool,
-    },
+    Setup,
 
     /// List available monitors
     ListMonitors,
@@ -86,25 +74,23 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start { port, virtual_display, width, height, refresh } => {
+        Commands::Start { port, width, height, refresh } => {
             let port = port.unwrap_or(3389);
-            let is_virtual = virtual_display;
-            info!("Starting remote desktop server on port {} (virtual={})", port, is_virtual);
+            info!("Starting headless remote desktop server on port {}", port);
 
             let state = ServerState::new();
 
-            // Start virtual display if requested
-            let virtual_display_guard = if is_virtual {
-                let compositor = virtual_display::check_compositor_available()?;
-                info!("Starting dedicated headless session with {}", compositor);
+            let compositor = virtual_display::check_compositor_available()?;
+            info!("Starting dedicated headless session with {}", compositor);
 
-                let mut vd = VirtualDisplay::new(width, height, refresh);
-                let session = vd.start()?;
-                state.set_virtual_mode(true);
-                state.set_headless_session(Some(session)).await;
-                Some(vd)
-            } else {
-                None
+            let mut vd = VirtualDisplay::new(width, height, refresh);
+            let session = vd.start()?;
+            state.set_headless_session(Some(session.clone())).await;
+            let virtual_display_guard = Some(vd);
+
+            let input_backend = remote_desktop_portal::InputBackend::HeadlessWayland {
+                runtime_dir: session.runtime_dir.clone(),
+                wayland_display: session.wayland_display.clone(),
             };
 
             // Write PID file
@@ -114,11 +100,6 @@ async fn main() -> anyhow::Result<()> {
 
             // Initialize input handler asynchronously
             let state_clone = state.clone();
-            let input_backend = if is_virtual {
-                remote_desktop_portal::InputBackend::Stub
-            } else {
-                remote_desktop_portal::InputBackend::Uinput
-            };
             tokio::spawn(async move {
                 state_clone.init_input_handler(input_backend).await;
             });
@@ -154,41 +135,21 @@ async fn main() -> anyhow::Result<()> {
             result
         }
 
-        Commands::Setup { reset, authorize } => {
-            info!("Running setup wizard (reset={}, authorize={})", reset, authorize);
-            SetupWizard::run(reset, authorize).await
+        Commands::Setup => {
+            info!("Running setup wizard");
+            SetupWizard::run().await
         }
 
         Commands::ListMonitors => {
             info!("Listing available monitors");
-            if let Some(session) = read_session_metadata()? {
-                println!("Available monitors:");
-                println!(
-                    "  - {} ({}x{}@{}Hz) [HEADLESS] [PRIMARY]",
-                    session.output_name, session.width, session.height, session.refresh_rate
-                );
-                Ok(())
-            } else {
-                match remote_desktop_core::enumerate_monitors() {
-                    Ok(monitors) => {
-                        println!("Available monitors:");
-                        for monitor in &monitors {
-                            println!("  - {} ({}x{}@{}Hz){}",
-                                monitor.name,
-                                monitor.resolution.0,
-                                monitor.resolution.1,
-                                monitor.refresh_rate,
-                                if monitor.is_primary { " [PRIMARY]" } else { "" }
-                            );
-                        }
-                        Ok(())
-                    }
-                    Err(e) => {
-                        error!("Failed to list monitors: {}", e);
-                        Err(e.into())
-                    }
-                }
-            }
+            let session = read_session_metadata()?
+                .ok_or_else(|| anyhow::anyhow!("No active headless session found. Start the server first."))?;
+            println!("Available monitors:");
+            println!(
+                "  - {} ({}x{}@{}Hz) [HEADLESS] [PRIMARY]",
+                session.output_name, session.width, session.height, session.refresh_rate
+            );
+            Ok(())
         }
 
         Commands::Status => {
