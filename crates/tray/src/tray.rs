@@ -14,6 +14,7 @@ pub enum TrayMessage {
     Exit,
 }
 
+#[allow(dead_code)]
 pub struct RemoteDesktopTray {
     pub hosts: Arc<Mutex<Vec<HostConfig>>>,
     pub tx: Sender<TrayMessage>,

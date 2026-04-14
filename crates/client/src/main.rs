@@ -10,7 +10,6 @@ mod clipboard;
 
 use clap::{Parser, Subcommand};
 use tracing::{info, error, warn};
-use connection::{ClientConnection, VideoPlayer};
 
 #[derive(Parser)]
 #[command(name = "remote-desktop")]
@@ -91,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Ok(())
             } else {
-                // Select monitor
+                // Resolve the monitor name once using the initial connection
                 let monitor_name = match monitor {
                     Some(ref m) => m.clone(),
                     None => {
@@ -105,93 +104,131 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
 
+                // Drop the initial connection; the reconnect loop will establish its own
+                drop(conn);
+
                 println!("Connecting to monitor: {}", monitor_name);
 
-                // Start streaming
-                let stream_info = conn.select_monitor(&monitor_name).await?;
-                println!("Stream started: {}x{}@{}fps",
-                    stream_info.width, stream_info.height, stream_info.fps);
-
-                // Create video player
-                let player_result = connection::VideoPlayer::new(
-                    stream_info.width,
-                    stream_info.height,
-                    stream_info.fps,
-                );
-
-                let mut player = match player_result {
-                    Ok(p) => p,
-                    Err(e) => {
-                        error!("Failed to create video player: {}", e);
-                        return Err(e);
-                    }
-                };
-
-                // Initialize clipboard (requires SDL context which is created in display)
-                // For now, we skip clipboard init since SDL context is owned by display
-                // The clipboard will be initialized when needed
-
-                // Receive and process frames
-                let start = std::time::Instant::now();
-                let mut last_stats = start;
+                let mut reconnect_delay = std::time::Duration::from_secs(1);
+                let max_delay = std::time::Duration::from_secs(30);
+                let mut player: Option<connection::VideoPlayer> = None;
 
                 loop {
-                    match conn.receive_message().await {
-                        Ok(Some(connection::ReceivedMessage::VideoFrame(frame))) => {
-                            // Process frame: decode, display, and get input events
-                            let input_messages = player.process_frame(&frame)?;
-
-                            // Send input events back to server
-                            for msg in input_messages {
-                                if let Err(e) = conn.send_message(msg).await {
-                                    error!("Failed to send input message: {}", e);
-                                }
-                            }
-
-                            // Check if window was closed
-                            if !player.is_running() {
-                                info!("Window closed, exiting");
-                                break;
-                            }
-
-                            // Check if we should exit (test mode)
-                            if test_duration > 0 {
-                                let elapsed = start.elapsed().as_secs();
-                                if elapsed >= test_duration {
-                                    info!("Test duration reached, exiting");
-                                    break;
-                                }
-                            }
-                        }
-                        Ok(Some(connection::ReceivedMessage::ClipboardEvent(event))) => {
-                            // Handle clipboard event from server
-                            if let Err(e) = player.handle_clipboard(&event) {
-                                warn!("Failed to handle clipboard event: {}", e);
-                            }
-                        }
-                        Ok(Some(connection::ReceivedMessage::StreamStats(_))) |
-                        Ok(Some(connection::ReceivedMessage::Pong(_))) => {
-                            // Stats and pongs are just logged, no action needed
-                        }
-                        Ok(None) => {
-                            // No message available, continue
+                    // Connect (or reconnect)
+                    let mut conn = match connection::ClientConnection::connect(&addr).await {
+                        Ok(c) => {
+                            reconnect_delay = std::time::Duration::from_secs(1); // reset backoff
+                            c
                         }
                         Err(e) => {
-                            error!("Error receiving message: {}", e);
-                            break;
+                            error!("Connection failed: {}. Retrying in {:?}...", e, reconnect_delay);
+                            tokio::time::sleep(reconnect_delay).await;
+                            reconnect_delay = (reconnect_delay * 2).min(max_delay);
+                            continue;
+                        }
+                    };
+
+                    // Select monitor (re-do handshake on each reconnection)
+                    let stream_info = match conn.select_monitor(&monitor_name).await {
+                        Ok(info) => info,
+                        Err(e) => {
+                            error!("Failed to select monitor: {}. Reconnecting...", e);
+                            tokio::time::sleep(reconnect_delay).await;
+                            reconnect_delay = (reconnect_delay * 2).min(max_delay);
+                            continue;
+                        }
+                    };
+
+                    info!("Stream started: {}x{}@{}fps", stream_info.width, stream_info.height, stream_info.fps);
+
+                    // Create video player once; reuse across reconnections
+                    if player.is_none() {
+                        match connection::VideoPlayer::new(
+                            stream_info.width,
+                            stream_info.height,
+                            stream_info.fps,
+                        ) {
+                            Ok(p) => player = Some(p),
+                            Err(e) => {
+                                error!("Failed to create video player: {}", e);
+                                return Err(e);
+                            }
                         }
                     }
 
-                    // Print stats every 5 seconds
-                    if last_stats.elapsed() >= std::time::Duration::from_secs(5) {
-                        info!("Streaming stats: {:.1} fps, {} frames received",
-                            player.fps(), player.frame_count());
-                        last_stats = std::time::Instant::now();
-                    }
-                }
+                    let p = player.as_mut().unwrap();
 
-                info!("Connection closed");
-                Ok(())
+                    // Streaming loop
+                    let mut disconnected = false;
+                    let start = std::time::Instant::now();
+                    let mut last_stats = start;
+
+                    loop {
+                        match conn.receive_message().await {
+                            Ok(Some(connection::ReceivedMessage::VideoFrame(frame))) => {
+                                // Process frame: decode, display, and get input events
+                                let input_messages = p.process_frame(&frame)?;
+
+                                // Send input events back to server
+                                for msg in input_messages {
+                                    if let Err(e) = conn.send_message(msg).await {
+                                        warn!("Failed to send input: {}", e);
+                                        disconnected = true;
+                                        break;
+                                    }
+                                }
+
+                                if disconnected {
+                                    break;
+                                }
+
+                                // Check if window was closed
+                                if !p.is_running() {
+                                    info!("Window closed, exiting");
+                                    return Ok(());
+                                }
+
+                                // Check if we should exit (test mode)
+                                if test_duration > 0 {
+                                    let elapsed = start.elapsed().as_secs();
+                                    if elapsed >= test_duration {
+                                        info!("Test duration reached, exiting");
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            Ok(Some(connection::ReceivedMessage::ClipboardEvent(event))) => {
+                                // Handle clipboard event from server
+                                if let Err(e) = p.handle_clipboard(&event) {
+                                    warn!("Failed to handle clipboard event: {}", e);
+                                }
+                            }
+                            Ok(Some(connection::ReceivedMessage::StreamStats(_))) |
+                            Ok(Some(connection::ReceivedMessage::Pong(_))) => {
+                                // Stats and pongs are just logged, no action needed
+                            }
+                            Ok(None) => {
+                                // No message available, continue
+                            }
+                            Err(e) => {
+                                warn!("Connection error: {}. Will reconnect...", e);
+                                break;
+                            }
+                        }
+
+                        // Print stats every 5 seconds
+                        if last_stats.elapsed() >= std::time::Duration::from_secs(5) {
+                            info!("Streaming stats: {:.1} fps, {} frames received",
+                                p.fps(), p.frame_count());
+                            last_stats = std::time::Instant::now();
+                        }
+                    }
+
+                    // If we get here, we disconnected — loop back and reconnect
+                    warn!("Disconnected. Reconnecting in {:?}...", reconnect_delay);
+                    tokio::time::sleep(reconnect_delay).await;
+                    reconnect_delay = (reconnect_delay * 2).min(max_delay);
+                }
             }
         }
 

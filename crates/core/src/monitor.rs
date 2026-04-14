@@ -1,6 +1,6 @@
 //! Monitor detection for multi-GPU systems
 //!
-//! Enumerates monitors across AMD and NVIDIA GPUs using libdrm and KWin D-Bus
+//! Enumerates monitors across AMD and NVIDIA GPUs using the Linux sysfs DRM interface
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -30,13 +30,15 @@ pub struct MonitorInfo {
 /// Enumerate all available monitors across all GPUs
 pub fn enumerate_monitors() -> super::Result<Vec<MonitorInfo>> {
     let mut monitors = Vec::new();
+    let drm_path = std::path::Path::new("/sys/class/drm");
 
-    // Use glob to find all DRM card devices
-    let card_pattern = std::path::Path::new("/dev/dri");
-
-    // Try to read card devices
-    let entries = std::fs::read_dir(card_pattern)
-        .map_err(|e| super::CoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+    let entries = match std::fs::read_dir(drm_path) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!("Cannot read /sys/class/drm: {}", e);
+            return Ok(vec![fallback_monitor()]);
+        }
+    };
 
     for entry in entries {
         let entry = match entry {
@@ -44,46 +46,102 @@ pub fn enumerate_monitors() -> super::Result<Vec<MonitorInfo>> {
             Err(_) => continue,
         };
 
-        let path = entry.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let name = entry.file_name().to_string_lossy().to_string();
 
-        // Only look at card* devices
-        if !name.starts_with("card") {
+        // Skip entries that don't look like connector entries (e.g. "version", "card0" without connector)
+        // Valid entries look like: card0-DP-1, card0-HDMI-A-1, card1-eDP-1
+        if !name.contains('-') || name.starts_with('.') {
             continue;
         }
 
-        debug!("Checking DRM device: {:?}", path);
+        let entry_path = entry.path();
 
-        // For now, add a placeholder monitor entry for each GPU
-        // In a full implementation, we'd enumerate actual connectors using the drm crate properly
-        let gpu_name = path.display().to_string();
-        debug!("Found GPU device: {}", gpu_name);
+        // Check if connected
+        let status_path = entry_path.join("status");
+        let status = std::fs::read_to_string(&status_path)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
 
-        // Add a placeholder monitor for this GPU
+        if status != "connected" {
+            debug!("Skipping {} (status: {})", name, status);
+            continue;
+        }
+
+        // Parse connector name from entry name (e.g., "card0-DP-1" -> connector "DP-1", gpu "card0")
+        let (gpu_name, connector) = match name.split_once('-') {
+            Some((gpu, conn)) => (gpu.to_string(), conn.to_string()),
+            None => continue,
+        };
+
+        // Read modes to get resolution
+        let modes_path = entry_path.join("modes");
+        let modes_content = std::fs::read_to_string(&modes_path).unwrap_or_default();
+        let first_mode = modes_content.lines().next().unwrap_or("1920x1080");
+
+        let (width, height) = parse_mode(first_mode);
+
+        // Check enabled state
+        let enabled_path = entry_path.join("enabled");
+        let enabled = std::fs::read_to_string(&enabled_path)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+
+        let gpu_device = format!("/dev/dri/{}", gpu_name);
+
+        debug!("Found monitor: {} on {} ({}x{}, enabled={})",
+            name, gpu_device, width, height, enabled);
+
         monitors.push(MonitorInfo {
-            name: format!("{}-DP-1", name),
-            gpu_device: gpu_name.clone(),
-            connector: "DP-1".to_string(),
-            resolution: (1920, 1080),
-            refresh_rate: 60,
-            is_primary: monitors.is_empty(), // First one is primary
+            name: name.clone(),
+            gpu_device,
+            connector,
+            resolution: (width, height),
+            refresh_rate: 60, // sysfs modes don't always include refresh, default to 60
+            is_primary: monitors.is_empty(), // First connected monitor is primary
         });
+    }
+
+    // Sort by name for consistent ordering
+    monitors.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Mark first as primary if none set
+    if !monitors.is_empty() && !monitors.iter().any(|m| m.is_primary) {
+        monitors[0].is_primary = true;
     }
 
     if monitors.is_empty() {
-        // Return a fallback for testing
-        warn!("No monitors detected via DRM, returning fallback");
-        monitors.push(MonitorInfo {
-            name: "card0-DP-1".to_string(),
-            gpu_device: "/dev/dri/card0".to_string(),
-            connector: "DP-1".to_string(),
-            resolution: (1920, 1080),
-            refresh_rate: 60,
-            is_primary: true,
-        });
+        warn!("No connected monitors found via sysfs, returning fallback");
+        monitors.push(fallback_monitor());
     }
 
+    info!("Detected {} monitors", monitors.len());
     Ok(monitors)
+}
+
+/// Parse a mode string like "1920x1080" into (width, height)
+fn parse_mode(mode: &str) -> (u32, u32) {
+    let parts: Vec<&str> = mode.trim().split('x').collect();
+    if parts.len() == 2 {
+        let w = parts[0].parse().unwrap_or(1920);
+        let h = parts[1].parse().unwrap_or(1080);
+        (w, h)
+    } else {
+        (1920, 1080)
+    }
+}
+
+/// Fallback monitor when detection fails
+fn fallback_monitor() -> MonitorInfo {
+    MonitorInfo {
+        name: "fallback-DP-1".to_string(),
+        gpu_device: "/dev/dri/card0".to_string(),
+        connector: "DP-1".to_string(),
+        resolution: (1920, 1080),
+        refresh_rate: 60,
+        is_primary: true,
+    }
 }
 
 /// Find a monitor by name
@@ -127,6 +185,23 @@ mod tests {
                 println!("Monitor enumeration error: {}", e);
             }
         }
+    }
+
+    #[test]
+    fn test_parse_mode() {
+        assert_eq!(parse_mode("1920x1080"), (1920, 1080));
+        assert_eq!(parse_mode("2560x1440"), (2560, 1440));
+        assert_eq!(parse_mode("3840x2160"), (3840, 2160));
+        assert_eq!(parse_mode("invalid"), (1920, 1080));
+        assert_eq!(parse_mode(""), (1920, 1080));
+    }
+
+    #[test]
+    fn test_fallback_monitor() {
+        let m = fallback_monitor();
+        assert_eq!(m.name, "fallback-DP-1");
+        assert_eq!(m.resolution, (1920, 1080));
+        assert!(m.is_primary);
     }
 
     #[test]

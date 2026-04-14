@@ -82,11 +82,13 @@ impl ClipboardHandler {
     }
 
     /// Get the current content hash (for preventing echo)
+    #[allow(dead_code)]
     pub fn current_hash(&self) -> Option<u64> {
         self.last_content_hash
     }
 
     /// Set the expected content hash (after setting clipboard from remote)
+    #[allow(dead_code)]
     pub fn set_expected_hash(&mut self, hash: u64) {
         self.last_content_hash = Some(hash);
     }
@@ -128,7 +130,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore] // Requires display server
+    
     fn test_clipboard_handler() {
         let sdl = sdl2::init().unwrap();
         let video = sdl.video().unwrap();

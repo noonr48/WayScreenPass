@@ -158,6 +158,7 @@ impl VideoDecoder {
     }
 
     /// Flush the decoder and get any remaining frames
+    #[allow(dead_code)]
     pub fn flush(&mut self) -> Result<Option<DecodedFrame>> {
         // Send EOF to signal end of stream
         let _ = self.decoder.send_eof();

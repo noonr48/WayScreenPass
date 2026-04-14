@@ -183,6 +183,7 @@ impl PortalSession {
 }
 
 /// Setup wizard for one-time authorization
+#[allow(dead_code)]
 pub async fn setup_wizard() -> super::Result<()> {
     println!("=== Remote Desktop Setup Wizard ===");
     println!();

@@ -10,7 +10,7 @@ use tokio::time::timeout;
 use tokio_util::codec::Framed;
 use futures_util::{SinkExt, StreamExt};
 use tracing::{debug, error, info, warn};
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 
 use crate::decoder::VideoDecoder;
 use crate::display::Display;
@@ -19,6 +19,7 @@ use crate::clipboard::ClipboardHandler;
 
 /// Messages that can be received from the server
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum ReceivedMessage {
     VideoFrame(remote_desktop_core::protocol::VideoFrame),
     ClipboardEvent(ClipboardEvent),
@@ -27,6 +28,7 @@ pub enum ReceivedMessage {
 }
 
 /// Client connection state
+#[allow(dead_code)]
 pub struct ClientConnection {
     framed: Framed<TcpStream, ProtocolCodec>,
     server_addr: String,
@@ -35,6 +37,7 @@ pub struct ClientConnection {
     stream_active: bool,
 }
 
+#[allow(dead_code)]
 impl ClientConnection {
     /// Create a new client connection
     pub async fn connect(server_addr: &str) -> Result<Self> {
@@ -306,10 +309,6 @@ impl ClientConnection {
                             }
                         }
                     }
-                    Ok(msg) => {
-                        debug!("Received unexpected message: {:?}", msg);
-                        Ok(None)
-                    }
                     Err(e) => {
                         error!("Failed to parse message: {}", e);
                         Err(e.into())
@@ -492,6 +491,7 @@ impl ClientConnection {
 }
 
 /// Video player that decodes and displays frames, and captures input
+#[allow(dead_code)]
 pub struct VideoPlayer {
     decoder: VideoDecoder,
     display: Display,

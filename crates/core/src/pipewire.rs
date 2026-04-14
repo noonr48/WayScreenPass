@@ -138,7 +138,7 @@ impl VideoStream {
                     *user_data.running.lock().unwrap() = false;
                 }
             })
-            .param_changed(|_, user_data, id, param| {
+            .param_changed(|_, _user_data, id, param| {
                 let Some(param) = param else {
                     return;
                 };
@@ -274,7 +274,7 @@ impl VideoStream {
     }
 
     /// Start the screen capture session
-    pub fn start(&mut self, _fd: std::os::fd::OwnedFd, width: u32, height: u32) -> super::Result<()> {
+    pub fn start(&mut self, width: u32, height: u32) -> super::Result<()> {
         debug!("Starting screen capture: {}x{} for monitor {}",
             width, height, self.monitor_name);
 
